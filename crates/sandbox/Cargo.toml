@@ -1,0 +1,27 @@
+# Linux enforcement. Every `unsafe` block in the project lives here, and the crate knows
+# nothing about cargo: it is handed a command and a capability envelope.
+#
+# It builds on every platform. On a non-Linux target the probe reports that no tier is
+# available and `hold()` refuses rather than pretending — which is what lets
+# `cargo check` and the pure tests run on a developer's Mac while the honest answer
+# about enforcement stays "not on this host".
+[package]
+name = "buildclamp-sandbox"
+description = "buildclamp Linux enforcement: seccomp-BPF, user-notification supervision, namespaces, Landlock"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+buildclamp-core = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+# Scratch directories for the enforcement tests, which write real files.
+tempfile = { workspace = true }

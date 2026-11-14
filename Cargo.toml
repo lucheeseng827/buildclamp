@@ -1,0 +1,141 @@
+# buildclamp — capability-gated execution of build scripts and proc-macros for Cargo.
+#
+# A STANDALONE workspace with its own Cargo.lock. Two reasons, and the second one is
+# specific to this module:
+#
+#   1. It pins `libc` and `cargo_metadata` independently, and pinning them in the repo's
+#      shared resolution would perturb every crate that shares it.
+#   2. `tests/fixtures/` holds deliberately hostile cargo packages — a build script that
+#      reconstructs a C2 address, writes outside OUT_DIR and reads secrets out of its
+#      parent's environment. They are path-dependencies of the integration tests ONLY.
+#      They must never become members of any workspace, here or at the repo root, or a
+#      plain `cargo build` would execute them. Both this module and the separate
+#      tree beside it are in the root Cargo.toml's `exclude` list for that reason
+#      as well as the usual one.
+#
+#   cargo build --release
+#   cargo test
+#
+# --- Why the crates split this way -------------------------------------------------
+# The product is one arrow — "cargo spawns a unit -> a policy decides -> the kernel
+# enforces -> a report says what happened" — so the crate boundaries follow that arrow,
+# not the feature list:
+#
+#   core     The policy model, the rustc-argv classifier, the event and report types,
+#            the environment-scrub decision, and observe -> policy generation. PURE:
+#            no I/O, no libc, no cargo, no clock. A policy that resolves the wrong
+#            envelope for a unit is the only way a build unit can be held to the wrong
+#            rules, so this surface must stay auditable line-by-line and testable with
+#            no kernel features in the build. `cargo test -p buildclamp-core` is a
+#            complete test of the policy semantics on any machine, including one where
+#            Landlock, seccomp and user namespaces are all unavailable.
+#   sandbox  Linux enforcement: host capability probing, the classic-BPF programs, the
+#            seccomp user-notification supervisor, namespaces and mounts. Knows nothing
+#            about cargo — it is handed a command and an envelope. This is where every
+#            `unsafe` block in the project lives, including the Landlock ruleset and the
+#            one syscall the child issues to apply it; see docs/adr/0002.
+#   shim     The three process roles cargo puts us in: the RUSTC_WRAPPER, the launcher
+#            a swapped build script execs, and the unit runner that ties core and
+#            sandbox together and writes one JSON record per unit. Knows cargo's file
+#            layout and nothing about kernels.
+#   cli      The `cargo-buildclamp` binary: build/check/test passthrough, observe, init,
+#            explain, report, doctor. Wiring and human output only.
+#
+# DAG: cli -> shim -> {core, sandbox}; core and sandbox are leaves and never depend on
+# each other. That direction is what stops policy decisions leaking into the enforcement
+# layer, where they could not be tested without a kernel.
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/sandbox", "crates/shim", "crates/cli"]
+# The hostile fixtures are built BY the tests, never by the workspace. Listing them
+# here would be a remote code execution vulnerability in our own `cargo build`.
+# `fuzz/` is likewise never a member: cargo-fuzz needs a nightly toolchain and links
+# libFuzzer, and a member carrying that requirement would make `cargo test` fail on the
+# stable toolchain this project pins. The properties the targets assert are library
+# functions in `buildclamp-core::fuzzcheck` and `buildclamp-sandbox::bpfcheck`, exercised
+# by `cargo test` on every commit against the same committed corpus the fuzzer seeds from.
+exclude = ["tests/fixtures", "fuzz"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+repository = "https://github.com/lucheeseng827/buildclamp"
+# Measured, not aspirational: the committed lock resolves only on 1.91. `clap_lex`
+# requires edition 2024 (1.85+) and `cargo-platform` declares 1.91. An earlier value of
+# 1.82 was a claim nothing had ever checked.
+rust-version = "1.91"
+
+# Kept deliberately lean, and what is NOT here is load-bearing for a tool whose whole
+# subject is what a build pulls in and then executes:
+#
+#   no `birdcage` (phylum-dev) — the obvious "just use the sandbox library" answer, and
+#     it is disqualified four times over. It is **GPL-3.0-or-later**, which would make
+#     this Apache-2.0 subcommand GPL the moment it linked; it was **archived read-only
+#     on 2026-07-06** after Veracode acquired Phylum's assets; its `Sandbox::spawn`
+#     asserts the calling process is single-threaded, and our supervisor thread has to
+#     exist before the fork (see docs/adr/0002); and it has one Linux backend with no
+#     tier concept, where naming which tier actually applied is this tool's central
+#     honesty property. The idea is worth taking — namespaces plus a seccomp allowlist,
+#     with a capability enum — and the licence means the code is not. See docs/adr/0003.
+#   no `seccompiler` / `libseccomp` — the filter here is a few dozen fixed instructions
+#     and it must be readable by a reviewer who does not trust us. A dependency that
+#     generates the filter moves the thing being audited out of the repository.
+#   no `nix` — a large surface for the handful of raw syscalls this needs; `libc` is
+#     already required and is what the kernel documentation is written against.
+#   no `tokio` — the supervisor is one thread blocked in an ioctl. An async runtime in
+#     a process that fork()s is a hazard, not a convenience.
+#   no HTTP client anywhere in the OSS build — a tool that denies build scripts the
+#     network must not itself be able to phone home, and CI asserts this.
+#   no `landlock` — and the tier is implemented, which is the point. It was a
+#     dependency that nothing ever called; it is now `crates/sandbox/src/linux/
+#     landlock.rs`, raw syscalls, for the same reason `seccompiler` is absent AND for
+#     one specific to this crate: the child applies the ruleset between fork and exec,
+#     where it must not allocate, and every ergonomic Landlock API allocates. The
+#     ruleset is built in the parent and the child issues one `landlock_restrict_self`.
+#     A dependency cannot be adapted into that shape from outside. See docs/adr/0002.
+[workspace.dependencies]
+buildclamp-core = { path = "crates/core", version = "0.1.0" }
+buildclamp-sandbox = { path = "crates/sandbox", version = "0.1.0" }
+buildclamp-shim = { path = "crates/shim", version = "0.1.0" }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+clap = { version = "4", features = ["derive"] }
+thiserror = "2"
+# Version requirements on grants (`version = ">=0.9, <0.10"`), and the version half of
+# a build unit's identity.
+semver = "1"
+# The raw syscall surface: seccomp, unshare, mount, prctl, the notification ioctls.
+libc = "0.2"
+# The unit graph, for attribution: which proc-macros are in a compiled crate's closure.
+cargo_metadata = "0.23"
+# Ed25519 signature VERIFICATION only, for `--require-signed-policy` (Y2 Q3). The same
+# implementation a signer uses, so a review counts one asymmetric-crypto library, not
+# two — which is why `ed25519-dalek` is not used (SECURITY.md). No signing capability is
+# reachable from the free binary, and no vendor key is compiled in; the trust root is
+# always the customer's. See crates/core/src/signed_policy.rs.
+ring = "0.17"
+# dev-dependency: per-test scratch directories for policies, run dirs and fixture builds.
+tempfile = "3"
+
+# The single static binary is a tested artefact — an air-gapped build host with no
+# package manager is one of the three places this has to run — so the release profile
+# that produces it lives with the workspace rather than in CI.
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+strip = true
+panic = "unwind"
+
+# The per-unit cost is a published number (3-4 ms fixed, 10-40 µs per notified
+# syscall), and `cargo test` runs the benchmark that defends it. An unoptimised build
+# measures the allocator rather than the supervisor, so give the hot crates real
+# codegen even under `cargo test`.
+[profile.dev.package.buildclamp-core]
+opt-level = 2
+
+[profile.dev.package.buildclamp-sandbox]
+opt-level = 2

@@ -1,0 +1,71 @@
+# OpenSSF Security Insights, https://github.com/ossf/security-insights-spec
+#
+# Machine-readable alongside the prose in SECURITY.md, so a consumer evaluating this
+# project can answer their questions without reading English. Where the two disagree,
+# SECURITY.md is the one a human wrote and the one to believe; this file being wrong is a
+# bug worth reporting.
+header:
+  schema-version: 1.0.0
+  last-updated: '2026-09-09'
+  last-reviewed: '2026-09-09'
+  project-url: https://github.com/lucheeseng827/buildclamp
+  changelog: https://github.com/lucheeseng827/buildclamp/blob/main/CHANGELOG.md
+  license: https://github.com/lucheeseng827/buildclamp/blob/main/LICENSE
+
+project-lifecycle:
+  status: concept
+  # Nothing has been released. Saying "active" here would be the kind of small
+  # overstatement this project's CLAIMS.toml exists to catch.
+  bug-fixes-only: false
+  core-maintainers:
+    - https://github.com/lucheeseng827
+  release-cycle: https://github.com/lucheeseng827/buildclamp/blob/main/RELEASING.md
+
+contribution-policy:
+  accepts-pull-requests: true
+  accepts-automated-pull-requests: false
+  # Contributions are replayed into a private monorepo preserving authorship; see
+  # CONTRIBUTING.md. Automated pull requests are declined because the replay is manual.
+  contributing-policy: https://github.com/lucheeseng827/buildclamp/blob/main/CONTRIBUTING.md
+  code-of-conduct: https://github.com/lucheeseng827/buildclamp/blob/main/CODE_OF_CONDUCT.md
+
+documentation:
+  - https://github.com/lucheeseng827/buildclamp/blob/main/README.md
+  - https://github.com/lucheeseng827/buildclamp/blob/main/ARCHITECTURE.md
+  - https://github.com/lucheeseng827/buildclamp/blob/main/docs/OPERATIONS.md
+  - https://github.com/lucheeseng827/buildclamp/blob/main/CLAIMS.toml
+
+security-testing:
+  - tool-type: sca
+    tool-name: cargo-deny
+    integration:
+      ad-hoc: true
+      ci: true
+      before-release: true
+  - tool-type: sca
+    tool-name: cargo-audit
+    integration:
+      ad-hoc: true
+      ci: true
+      before-release: true
+
+security-assessments:
+  # None. A third-party audit of crates/sandbox/src/linux is planned and unfunded; the
+  # absence is stated in README.md rather than left blank here.
+  - auditor-name: none
+    auditor-url: https://github.com/lucheeseng827/buildclamp/blob/main/README.md
+    auditor-report: https://github.com/lucheeseng827/buildclamp/blob/main/README.md
+    report-year: 2026
+
+vulnerability-reporting:
+  accepts-vulnerability-reports: true
+  security-policy: https://github.com/lucheeseng827/buildclamp/blob/main/SECURITY.md
+  bug-bounty-available: false
+
+dependencies:
+  third-party-packages: true
+  dependencies-lists:
+    - https://github.com/lucheeseng827/buildclamp/blob/main/Cargo.lock
+  sbom:
+    - sbom-format: CycloneDX
+      sbom-url: https://github.com/lucheeseng827/buildclamp/blob/main/SECURITY.md

@@ -1,0 +1,38 @@
+{
+  "_type": "https://in-toto.io/Statement/v1",
+  "subject": [
+    {
+      "name": "libthing.rlib",
+      "digest": {
+        "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    }
+  ],
+  "predicateType": "https://buildclamp.dev/attestation/v1",
+  "predicate": {
+    "format_version": 1,
+    "artefact_name": "libthing.rlib",
+    "artefact_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "policy_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "report_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "enforcement_summary": {},
+    "units_held": 3,
+    "ungranted_requests": 0,
+    "operator_overrides": [],
+    "enforcement_profile": {
+      "read_deny": true,
+      "read_deny_ruleset_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+      "compile_units_held": true,
+      "net_destinations_recorded_only": true,
+      "landlock_abi_used": 7,
+      "disable_overrides": []
+    },
+    "scope": {
+      "not_held": [
+        "Network destinations were recorded and never enforced."
+      ]
+    },
+    "built_at": "2026-09-15T10:00:00Z",
+    "key_id": "key-1"
+  }
+}

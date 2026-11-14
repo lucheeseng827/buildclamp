@@ -1,0 +1,9 @@
+[package]
+name = "evilmacro"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Test fixture: a proc-macro that misbehaves at EXPANSION time, inside rustc."
+
+[lib]
+proc-macro = true

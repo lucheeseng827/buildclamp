@@ -1,0 +1,7 @@
+version = 1
+
+[grants."evil"]
+capabilities = ["net", "fs-write"]
+write-zones = ["manifest-dir"]
+why = "x"
+reviewed = true

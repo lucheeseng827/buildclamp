@@ -1,0 +1,76 @@
+# buildclamp example capability baseline.
+#
+# A baseline is a PUBLISHED document saying what a crate does at one exact version, so
+# that `cargo buildclamp init --accept-baseline baseline.toml` can mark the grants it
+# covers `reviewed = true` against a reviewer of record — and the ones it does not cover
+# are a list somebody can actually read.
+#
+#     cargo buildclamp observe
+#     cargo buildclamp init --accept-baseline baseline.toml
+#
+# The last line `init` prints is the residual: how many grants are still unreviewed. That
+# is the number that says whether a baseline is worth anything. One that covers everything
+# in your graph is making a very strong claim and is worth looking at twice.
+#
+# --- What accepting a baseline may and may not do -----------------------------------
+#
+# It matches on the EXACT version and pins the grant it writes to that version, so a patch
+# bump comes back for review rather than inheriting an approval nobody made. It only ever
+# narrows: a crate that did something this document does not describe stays unreviewed,
+# and an acceptance can never add a capability to a grant. And it records this file's
+# SHA-256 in `buildclamp.toml`, so a reader holding both can tell whether the second is
+# the document the first was written against.
+#
+# The digest is not a defence against an adversary — anyone who can write `reviewed =
+# true` can write a digest beside it. It answers "which document?", not "who may say?".
+#
+# --- Writing one --------------------------------------------------------------------
+#
+# The entries below are ILLUSTRATIVE. They are the shape of the thing, not a vouching for
+# these versions: nobody on this project has read these build scripts at these releases,
+# and a baseline whose author has not is worth nothing. Write your own from crates you
+# have looked at, or use one whose publisher you are willing to name as your reviewer.
+
+version = 1
+
+# Where this document lives, so a reader holding only a digest can go and get it.
+source = "https://example.invalid/buildclamp/baseline-2026-09.toml"
+published = "2026-09-01"
+
+[[crate]]
+name = "libc"
+version = "0.2.176"
+# Everything the crate is allowed to have asked for. A grant is accepted when what it
+# asks for is a SUBSET of this — using less is fine and ordinary, using more is not.
+capabilities = ["fs-write", "exec", "unix"]
+write-zones = ["out-dir", "tmp"]
+why = "probes the target with a compiler and writes cfg flags to OUT_DIR"
+
+[[crate]]
+name = "cc"
+version = "1.2.42"
+capabilities = ["fs-write", "exec", "unix"]
+# `cc` stages objects in the system temporary directory as well as OUT_DIR, which is why
+# denying `tmp` by default would break the common case rather than tighten it.
+write-zones = ["out-dir", "tmp"]
+why = "compiles C sources with the host toolchain, staging objects in TMP and OUT_DIR"
+
+[[crate]]
+name = "proc-macro2"
+version = "1.0.108"
+capabilities = ["fs-write", "exec", "unix"]
+write-zones = ["out-dir", "tmp"]
+why = "detects whether the compiler exposes the unstable proc_macro span API"
+
+# A network entry, spelled out because it is the one shape that needs care. Destinations
+# are RECORDED and never enforced, so listing one here is not a promise the tool can keep
+# — it is a statement that this crate reaching this host at build time is expected. A
+# grant naming any other destination is not accepted.
+#
+# [[crate]]
+# name = "some-vendored-sys"
+# version = "0.9.4"
+# capabilities = ["net", "fs-write", "exec", "unix"]
+# write-zones = ["out-dir", "tmp"]
+# net-destinations = ["downloads.example.org:443"]
+# why = "downloads and verifies a pinned upstream tarball when no system library is found"

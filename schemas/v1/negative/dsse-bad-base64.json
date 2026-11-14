@@ -1,0 +1,10 @@
+{
+  "payload": "not base64!!",
+  "payloadType": "application/vnd.in-toto+json",
+  "signatures": [
+    {
+      "keyid": "key-1",
+      "sig": "AAAA"
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+[package]
+name = "probemacro"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Test fixture: a proc-macro that issues a syscall from its OWN code at expansion time, so the trapping instruction pointer falls inside its shared object and attribution is `exact`."
+
+[lib]
+proc-macro = true

@@ -1,0 +1,87 @@
+# The public surface of buildclamp-sandbox.
+#
+# This file IS the promise. `crates/sandbox/tests/api.rs` compares the source against it
+# and fails on any difference, in either direction — so enlarging what this crate keeps
+# working forever is a line in a diff somebody looked at, rather than something that
+# happened.
+#
+# Not everything here is reachable by a consumer: the scanner reads declarations out of
+# the text rather than from rustdoc's JSON, which is nightly-only, so it also lists items
+# declared `pub` inside a private module. That is the safe direction — an item that
+# becomes reachable later is already written down, and the change shows up in `lib.rs`'s
+# `pub use` lines, which are listed too.
+#
+# What is FROZEN, as opposed to merely listed, is in API.md, and `tests/frozen_api.rs`
+# pins each of those at its exact type so the compiler enforces it.
+enum HoldError
+fn hold
+fn projected_tiers
+linux::attribution::fn attribute
+linux::bpf::const AUDIT_ARCH_AARCH64: u32
+linux::bpf::const AUDIT_ARCH_X86_64: u32
+linux::bpf::const NATIVE: Arch
+linux::bpf::const WRITE_OPEN_MASK: u32
+linux::bpf::enum Arch
+linux::bpf::fn audit
+linux::bpf::fn bind
+linux::bpf::fn build
+linux::bpf::fn denied
+linux::bpf::fn every_number
+linux::bpf::fn exec_observed
+linux::bpf::fn finish
+linux::bpf::fn for_native
+linux::bpf::fn jeq
+linux::bpf::fn jne
+linux::bpf::fn jset
+linux::bpf::fn jset_to
+linux::bpf::fn label
+linux::bpf::fn ld_abs_w
+linux::bpf::fn net_observed
+linux::bpf::fn new
+linux::bpf::fn open_flag_argument
+linux::bpf::fn openat2_number
+linux::bpf::fn ret
+linux::bpf::fn table_for
+linux::bpf::fn write_observed
+linux::bpf::struct Builder
+linux::bpf::struct FilterOptions
+linux::bpf::struct Label
+linux::bpf::struct Syscalls
+linux::bpfcheck::enum Verdict
+linux::bpfcheck::fn all_options
+linux::bpfcheck::fn check
+linux::bpfcheck::fn expected
+linux::bpfcheck::fn run
+linux::bpfcheck::struct SeccompData
+linux::fn hold
+linux::landlock::fn build
+linux::landlock::fn entries
+linux::landlock::fn handled_access
+linux::landlock::fn mechanism
+linux::landlock::fn raw_fd
+linux::landlock::fn read_roots
+linux::landlock::struct Ruleset
+linux::landlock::unsafe fn restrict_self
+linux::mod attribution
+linux::mod bpf
+linux::mod bpfcheck
+linux::mod landlock
+linux::mod ns
+linux::mod seccomp
+linux::ns::fn new
+linux::ns::struct Prepared
+linux::ns::unsafe fn apply_in_child
+linux::seccomp::enum Decision
+linux::seccomp::fn new
+linux::seccomp::fn recv_listener
+linux::seccomp::fn supervise
+linux::seccomp::struct CmsgBuffer
+linux::seccomp::trait Decider: Send
+linux::seccomp::unsafe fn install
+linux::seccomp::unsafe fn send_listener
+mod probe
+probe::fn host
+struct Held
+struct Plan
+use crate::linux::bpf
+use crate::linux::bpfcheck

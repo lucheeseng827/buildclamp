@@ -1,0 +1,66 @@
+{
+  "_comment": [
+    "The syscalls buildclamp's sandbox issues that a restrictive container seccomp profile",
+    "is likely to refuse. This is NOT a complete profile: it is the delta, to be merged",
+    "into whatever profile your runtime already applies, by ops/make-seccomp-profile.sh.",
+    "",
+    "Why a delta and not a whole profile. A container's default profile is an ALLOWLIST of",
+    "around three hundred syscall names, and a copy of it that this project maintained by",
+    "hand would be wrong in the direction that breaks containers: one name missing and an",
+    "unrelated program in the image stops working, with an EPERM that names nothing. The",
+    "authoritative copy is the one your runtime ships. This file says what to add to it.",
+    "",
+    "Every entry below was read out of crates/sandbox/src, not out of a specification:",
+    "`grep -rhoE 'libc::SYS_[a-z0-9_]+|libc::(unshare|mount|umount2|prctl|ioctl)' crates/sandbox/src`",
+    "is the check, and ops/make-seccomp-profile.sh runs it so that a syscall added to the",
+    "sandbox and not to this file fails CI rather than a customer's container."
+  ],
+
+  "additions": [
+    {
+      "names": ["unshare"],
+      "why": "creates the user, mount and network namespaces. Docker's default profile permits the name; several hardened profiles and some managed node images do not, and a profile that permits `unshare` only with no namespace flags is the same as not permitting it here.",
+      "used_by": "crates/sandbox/src/linux/ns.rs"
+    },
+    {
+      "names": ["clone", "clone3"],
+      "why": "the fork between installing the namespace and applying the seccomp filter. Docker's default profile allows `clone` only when NO namespace flag is set and returns ENOSYS for `clone3` without CAP_SYS_ADMIN; buildclamp does not pass namespace flags to clone — it unshares first — but glibc's `fork` reaches `clone3` on current versions, so a profile that ENOSYSes it forces the slower path or fails outright.",
+      "used_by": "crates/sandbox/src/linux/ns.rs"
+    },
+    {
+      "names": ["mount", "umount2", "pivot_root"],
+      "why": "the read-only root. All three run INSIDE the new mount namespace, where they affect nothing outside the container — but a seccomp profile is applied per task and cannot tell the two cases apart, so it has to permit them.",
+      "used_by": "crates/sandbox/src/linux/ns.rs"
+    },
+    {
+      "names": ["seccomp"],
+      "why": "installs the filter that refuses or records a unit's syscalls. Without it nothing below the namespace tier works at all, and `doctor` reports `seccomp notification: no`.",
+      "used_by": "crates/sandbox/src/linux/seccomp.rs"
+    },
+    {
+      "names": ["prctl"],
+      "why": "PR_SET_NO_NEW_PRIVS, which the kernel requires before an unprivileged process may install a seccomp filter. Almost every profile already permits it; it is listed because omitting it makes the seccomp tier fail with EACCES rather than with anything that names the cause.",
+      "used_by": "crates/sandbox/src/linux/seccomp.rs"
+    },
+    {
+      "names": ["ioctl"],
+      "why": "SECCOMP_IOCTL_NOTIF_RECV, _SEND and _ID_VALID — the supervisor's whole conversation with the kernel. Profiles that permit `ioctl` only for a named set of requests will refuse these three.",
+      "used_by": "crates/sandbox/src/linux/seccomp.rs"
+    },
+    {
+      "names": ["capset"],
+      "why": "drops the capabilities the new user namespace hands the child, so a unit does not run with a full capability set inside its own namespace.",
+      "used_by": "crates/sandbox/src/linux/ns.rs"
+    },
+    {
+      "names": [
+        "landlock_create_ruleset",
+        "landlock_add_rule",
+        "landlock_restrict_self"
+      ],
+      "numbers_x86_64": [444, 445, 446],
+      "why": "the filesystem tier. These are newer than most published profiles, and a profile whose default action is ERRNO refuses every syscall it has never heard of — so on such a host Landlock reports absent when the kernel has it. That is the single most common way a container reports a weaker tier than its kernel can provide, and it looks identical to an old kernel.",
+      "used_by": "crates/sandbox/src/linux/landlock.rs"
+    }
+  ]
+}

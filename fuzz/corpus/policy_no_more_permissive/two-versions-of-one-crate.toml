@@ -1,0 +1,11 @@
+version = 1
+
+[[grants."libc"]]
+version = "<1"
+capabilities = ["exec"]
+why = "a"
+
+[[grants."libc"]]
+version = ">=1"
+capabilities = ["net"]
+why = "b"

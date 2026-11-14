@@ -1,0 +1,26 @@
+# The correctness-critical crate. A policy that resolves the wrong envelope for a build
+# unit is the only way a unit can be held to the wrong rules, so this crate stays pure —
+# no I/O, no libc, no cargo, no clock — and its whole test suite runs with no kernel
+# features in the build. That property is what lets a reviewer on a Mac, or on a kernel
+# with no Landlock and no user namespaces, still test every policy decision this tool
+# makes. The single dependency beyond serde/toml/semver is `ring`, for Ed25519 signature
+# VERIFICATION only (signed policy layers) — pure computation with no I/O and no clock, so
+# the kernel-free testability holds and no signing key is reachable from this crate.
+[package]
+name = "buildclamp-core"
+description = "buildclamp policy model, build-unit classification, and the capability report"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+semver = { workspace = true }
+thiserror = { workspace = true }
+# Ed25519 signature verification for signed policy layers (verify-only; see the crate note
+# above and crates/core/src/signed_policy.rs). Pure computation: no I/O, no clock.
+ring = { workspace = true }

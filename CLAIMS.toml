@@ -1,0 +1,695 @@
+# Every claim this project makes in the present tense, and the thing that makes it true.
+#
+# ## Why this file exists
+#
+# This project's credibility is that it does not overstate, and it has overstated three
+# times in one week — each time in a document, never in the code:
+#
+#   * `README.md:3` said every proc-macro runs inside a capability envelope. No compile
+#     unit is held; `crates/cli/src/main.rs` passes `HoldCompile` straight through.
+#   * Its positioning said "nobody has shipped this" about per-proc-macro handling.
+#     `cargo-acl` sandboxes rustc, which holds every proc-macro coarsely but really.
+#   * `REPORT_FORMAT_VERSION`'s own doc comment described a contract no consumer honoured.
+#
+# Prose drifts from code silently because nothing compiles it. This file is the join: a
+# claim, where it is made, what it assumes, and the evidence — a named test, or a dated
+# search for an absence. `crates/cli/tests/claims.rs` enforces the join.
+#
+# ## The rule for absence claims
+#
+# A claim that *nobody else* does something is the most dangerous kind, because it is
+# false the moment a competitor ships and nothing tells you. Every one needs `search`,
+# `sources` and `checked`, and goes stale on a clock.
+#
+# ## What this file is not
+#
+# Not a marketing register. A claim belongs here when it is load-bearing — when a reader
+# deciding whether to trust the tool would act on it.
+
+version = 1
+
+# The freshness window for an absence claim, in days. An absence claim older than this
+# fails the gate: it describes a search nobody has repeated, and the competitor it is
+# about has had four months to ship.
+absence_max_age_days = 120
+
+# ---------------------------------------------------------------- capability claims
+
+[[claim]]
+id = "tier-reported-per-capability"
+kind = "capability"
+text = "The report records, per capability per unit, which enforcement tier actually applied."
+where = ["README.md", "ARCHITECTURE.md", "CHANGELOG.md"]
+context = "Linux. Which tier is reached depends on the host; `doctor` reports what is available."
+assumptions = [
+  "the host offers at least seccomp; with nothing at all the tier is `none` and says so",
+]
+evidence = ["test:a_unit_denied_the_network_cannot_open_an_internet_socket"]
+checked = "2026-09-09"
+
+[[claim]]
+id = "require-enforced-fails-advisory"
+kind = "capability"
+text = "`--require-enforced` fails a run where any capability could only be constrained advisorily."
+where = ["README.md", "docs/OPERATIONS.md"]
+context = "Linux."
+assumptions = []
+evidence = ["test:require_enforced_fails_where_the_host_can_only_be_advisory"]
+checked = "2026-09-09"
+
+[[claim]]
+id = "hostile-fixture-stopped-and-named"
+kind = "capability"
+text = "The replica of the August 2026 arrayref build script is stopped, and the refusal names the crate."
+where = ["README.md", "CHANGELOG.md", "tests/fixtures/README.md"]
+context = "Linux with user namespaces. On a host without them the test declines to assert rather than passing."
+assumptions = ["the host can reach an enforcing tier; the suite fails rather than skips if it cannot tell"]
+evidence = ["test:the_replica_of_the_arrayref_build_script_is_stopped_and_named"]
+checked = "2026-09-09"
+
+[[claim]]
+id = "proc-macro-expansion-is-held"
+kind = "capability"
+text = "With `hold-compile-units = true`, what a proc-macro does at expansion time is held to the compile envelope, and a refusal names the compilation plus the proc-macros in its closure."
+where = ["README.md", "docs/CONFIG.md"]
+context = "Linux with user namespaces. Expansion happens inside the rustc compiling the consumer, so this holds every compile unit in the graph, not only the ones that expand a macro."
+assumptions = [
+  "ONE SHARED POLICY PER COMPILATION, not per macro: the rustc has already loaded every proc-macro in its closure, so the report names which could have been responsible and never which was",
+  "opt-in: this is every rustc in the graph rather than one process per crate with a build script, and the overhead measurement is the gate for making it default",
+  "a proc-macro can detect that it is held and emit different code; cargo-acl's README says the same",
+  "a compile that cannot be held passes through rather than failing the build, because refusing every crate in a graph over a sandbox that would not start is how a tool gets uninstalled",
+]
+evidence = [
+  "test:an_unheld_compile_lets_a_proc_macro_persist_to_the_home_directory",
+  "test:a_held_compile_refuses_what_the_proc_macro_does_at_expansion_time",
+  "test:a_refusal_inside_a_compile_names_the_macros_that_could_have_been_responsible",
+  "test:an_ordinary_build_survives_having_its_compile_units_held",
+]
+checked = "2026-09-15"
+
+[[claim]]
+id = "env-allowlist-narrows-and-never-widens"
+kind = "capability"
+text = "With `env-allowlist = true` a build unit sees only the base set plus what its grant names, and the allowlist can never re-admit a name the deny-list removed."
+where = ["README.md", "docs/CONFIG.md"]
+context = "Any host: this is a decision about what is placed in the unit's environment at exec, not a kernel mechanism, so no tier applies to it."
+assumptions = [
+  "the deny-list runs first; `CARGO_*` is in the base set and `CARGO_REGISTRY_TOKEN` starts with it, so the order is what stops the allowlist handing back a credential",
+  "a grant ADDS to the base set rather than replacing it, or every grant would have to re-list eighteen cargo variables",
+  "opt-in, because an allowlist switched on underneath an existing user breaks builds with a missing-variable panic from inside a dependency",
+  "it controls exposure, not reads: there is no syscall for getenv, and the /proc/<pid>/environ hole is closed by the user namespace and nothing else",
+]
+evidence = [
+  "test:the_allowlist_cannot_hand_back_what_the_deny_list_removed",
+  "test:an_ordinary_variable_survives_a_deny_list_and_does_not_survive_an_allowlist",
+  "test:the_base_set_keeps_a_build_script_working_under_an_allowlist",
+  "test:a_hard_denied_name_still_needs_the_loud_opt_in_under_an_allowlist",
+  "test:an_ordinary_build_script_still_builds_under_an_environment_allowlist",
+]
+checked = "2026-09-15"
+
+[[claim]]
+id = "withheld-reads-are-refused-by-the-kernel"
+kind = "capability"
+text = "With `withhold-secret-reads = true`, a build script cannot read or list the named credential paths, and the refusal is the kernel's rather than a supervisor's."
+where = ["README.md", "docs/CONFIG.md"]
+context = "Linux with Landlock. Without Landlock the tier is `none` with a reason and nothing is withheld; a mount namespace cannot express a read restriction."
+assumptions = [
+  "it is a DENY-LIST: every path not named stays readable, and the documentation must never describe it as an allow-list",
+  "opt-in, because reads have been unrestricted since this tool existed and turning a default-deny on underneath existing users would break builds they did not change",
+  "a withheld read leaves no request in the report — Landlock refuses in the kernel with no supervisor, which is what makes it enforcement and also what makes it unobservable",
+]
+evidence = [
+  "test:a_withheld_credential_is_refused_at_a_named_enforced_tier",
+  "test:a_build_script_reads_every_planted_credential_when_nothing_withholds_them",
+  "test:staging_a_withheld_path_into_out_dir_fails_rather_than_staging_nothing_quietly",
+  "test:an_ordinary_read_still_works_while_credentials_are_withheld",
+]
+checked = "2026-09-15"
+
+[[claim]]
+id = "publish-is-gated-before-the-upload"
+kind = "capability"
+text = "`cargo buildclamp publish --require-enforced` refuses before cargo runs on a host that cannot enforce, so nothing is uploaded, and the registry token is the only credential kept in cargo's environment for that verb."
+where = ["README.md", "docs/CONFIG.md"]
+context = "Linux. The tier that decides it is the environment one: `enforced:scrub+userns` passes, `advisory:scrub` is refused."
+assumptions = [
+  "the projection `doctor` uses is the same function that labels a real run, so the pre-flight answer and the report's tier cannot disagree",
+  "without `--require-enforced` the publish proceeds and warns; refusing outright would make buildclamp the reason a release did not go out",
+]
+evidence = [
+  "test:publish_refuses_before_the_upload_when_it_cannot_enforce",
+  "test:publish_keeps_the_registry_token_that_every_other_verb_drops",
+  "test:every_other_verb_still_drops_the_registry_token",
+]
+checked = "2026-09-15"
+
+[[claim]]
+id = "config-wrapper-override-is-warned-about"
+kind = "capability"
+text = "A `rustc-wrapper` configured in a cargo config file, which buildclamp has to override, produces a warning naming the file rather than silently ceasing to run."
+where = ["README.md", "docs/CONFIG.md"]
+context = "Linux, cargo 1.94.1. The warning is best effort: it reads ancestor `.cargo/config.toml`, the extensionless `.cargo/config` spelling and `$CARGO_HOME`, and does not claim to resolve cargo's whole config hierarchy."
+assumptions = [
+  "the config that configures the wrapper is one of the files listed above; a wrapper set by `--config` on the cargo command line is not seen",
+  "the key is parsed rather than grepped, so a commented-out wrapper is correctly silent",
+]
+evidence = ["test:a_wrapper_configured_in_a_config_file_is_found_so_it_can_be_warned_about"]
+checked = "2026-09-15"
+
+[[claim]]
+id = "benign-fixture-zero-ungranted"
+kind = "capability"
+text = "An ordinary build script — the shape shared by cc, bindgen and pkg-config — produces zero ungranted requests under the defaults."
+where = ["README.md", "docs/adr/0001-observe-before-enforce.md"]
+context = "Linux."
+assumptions = []
+evidence = ["test:an_ordinary_build_script_produces_no_ungranted_requests"]
+checked = "2026-09-09"
+
+[[claim]]
+id = "report-version-refused-by-name"
+kind = "capability"
+text = "A report written by a newer buildclamp is refused by version rather than parsed for what this build recognises."
+where = ["crates/core/src/report.rs"]
+context = "Every consumer reads through `Report::from_json`."
+assumptions = []
+evidence = ["test:a_report_from_a_newer_buildclamp_is_refused_by_version_and_named"]
+checked = "2026-09-09"
+
+[[claim]]
+id = "declared-surface-is-read"
+kind = "capability"
+text = "Every environment variable and command-line flag the tool declares is read by something in production code."
+where = ["crates/cli/tests/surface.rs"]
+context = "Production source only; each file is cut at its first `#[cfg(test)]`."
+assumptions = [
+  "a value written AND read but never acted on is NOT caught by this; that needs a behavioural test",
+]
+evidence = [
+  "test:every_environment_variable_the_tool_sets_is_read_by_something",
+  "test:every_command_line_flag_is_read_outside_the_place_it_is_declared",
+]
+checked = "2026-09-09"
+
+[[claim]]
+id = "unsafe-confined-to-the-sandbox-crate"
+kind = "capability"
+text = "Every `unsafe` block in the project is in `crates/sandbox`; every other crate forbids it at compile time."
+where = ["crates/sandbox/src/lib.rs", "crates/sandbox/INTERNALS.md", "ARCHITECTURE.md"]
+context = "All targets. The claim is about the source tree, not about a host."
+assumptions = [
+  "the scope of a third-party audit is scoped against this sentence, so it is load-bearing as well as technical",
+]
+evidence = ["test:every_crate_outside_the_sandbox_forbids_unsafe_code"]
+checked = "2026-09-09"
+
+# ---------------------------------------------------------------- absence claims
+
+[[claim]]
+id = "no-published-binary-links-a-network-client"
+kind = "capability"
+text = "No published binary links a network client, asserted over each binary's resolved dependency closure."
+where = ["SECURITY.md", "docs/adr/0005-the-artefact-boundary.md"]
+context = """
+About LINKING, not behaviour. The free binary spawns cargo, which fetches crates, so the
+tool is one exec from the network at the process level. What is asserted is that no code
+path inside either artefact opens a socket.
+"""
+assumptions = [
+  "`cargo tree -e normal` scope: development and build dependencies are excluded, because neither ships inside the artefact; the repo-wide Cargo.toml grep is what covers those",
+  "a server, if built, is a separate repository and is NOT covered by this claim — it is permitted a network stack",
+]
+evidence = ["script:ops/no-network-closure.sh"]
+checked = "2026-09-09"
+
+[[claim]]
+id = "the-kill-switch-is-never-silent"
+kind = "capability"
+text = "A run with enforcement switched off still produces a report that names the switch, and the terminal says so above the counts."
+where = ["docs/OPERATIONS.md", "docs/CONFIG.md"]
+context = """
+Three switches can produce an override: BUILDCLAMP_MODE=off, `enforcement = "disabled"` in
+the policy, and BUILDCLAMP_DISABLE for one mechanism. The first two stop everything; the
+third leaves a weaker mechanism still reporting `enforced:`, which is why it is recorded
+too.
+"""
+assumptions = [
+  "the driver runs; a build that never reaches buildclamp at all is the coverage question in README.md, not this one",
+]
+evidence = [
+  "test:the_environment_switch_lets_the_build_through_and_says_so",
+  "test:the_policy_switch_works_and_is_attributed_to_the_policy",
+  "test:the_per_mechanism_knob_is_recorded_even_though_it_still_enforces",
+]
+checked = "2026-09-09"
+
+[[claim]]
+id = "break-glass-is-free-and-offline"
+kind = "capability"
+text = "The free tool can gate a build and then ungate it with no account, no network and no server."
+where = ["README.md", "CHANGELOG.md", "docs/OPERATIONS.md"]
+context = """
+Linux, on a host that can enforce; the test skips where it cannot, and says so. Gating is
+the default envelope refusing a capability; ungating is an `[[exception]]` block in
+`buildclamp.toml`. Nothing in the path contacts anything — the mechanism is a file the
+build reads.
+"""
+assumptions = [
+  "the crate's build script survives the refusal; a script that dies still dies, because an exception changes what the run exits with and not what a syscall already returned",
+]
+evidence = [
+  "test:the_free_tool_can_gate_a_build_and_then_ungate_it_with_no_account_and_no_network",
+]
+checked = "2026-09-15"
+
+[[claim]]
+id = "an-exception-cannot-widen-where-a-crate-may-write"
+kind = "capability"
+text = "An exception grants capabilities and never widens `write-zones`; a write outside them is still refused by the kernel."
+where = ["README.md", "CHANGELOG.md", "docs/OPERATIONS.md"]
+context = """
+This is what keeps break-glass from being an off switch under another name. The run's
+verdict stands down for the named crate; the filesystem tier does not move. Needs Landlock
+or a mount namespace for the write to be refused at all — on a host with neither, the tier
+is `none` and the report says so.
+"""
+assumptions = []
+evidence = [
+  "test:the_free_tool_can_gate_a_build_and_then_ungate_it_with_no_account_and_no_network",
+]
+checked = "2026-09-15"
+
+[[claim]]
+id = "grace-never-excuses-a-grant-that-was-already-known"
+kind = "capability"
+text = "`--grace <days>` excuses only grants first seen inside the window, and never one carrying no `first-seen` at all."
+where = ["README.md", "CHANGELOG.md", "docs/OPERATIONS.md"]
+context = """
+Host-independent: this is a policy decision made in `buildclamp-core`, which is pure. The
+undated case is every policy written before the field existed and every grant added by
+hand, and it is the fail-closed direction.
+"""
+assumptions = []
+evidence = [
+  "test:grace_never_suppresses_a_grant_that_was_already_known",
+  "test:grace_warns_on_a_new_grant_and_fails_on_one_that_was_already_known",
+]
+checked = "2026-09-15"
+
+[[claim]]
+id = "accept-baseline-never-marks-what-it-does-not-cover"
+kind = "capability"
+text = "`init --accept-baseline` marks a grant reviewed only where the document covers that exact version, and pins the grant it writes to that version."
+where = ["README.md", "CHANGELOG.md", "docs/OPERATIONS.md"]
+context = """
+Host-independent. Four ways a grant can fall outside a baseline — a different version, a
+different crate, one capability more than the entry allows, and a destination the document
+never mentioned — and each leaves the grant exactly as a baseline-less `init` would have
+written it.
+"""
+assumptions = [
+  "the digest identifies which document vouched and defends against nothing: anyone who can write `reviewed = true` can write a digest beside it, and the registry entry says so rather than implying otherwise",
+]
+evidence = [
+  "test:a_baseline_never_marks_reviewed_anything_it_does_not_cover",
+  "test:accept_baseline_marks_what_the_document_covers_and_nothing_else",
+]
+checked = "2026-09-15"
+
+[[claim]]
+id = "the-filter-answers-what-the-tables-say"
+kind = "capability"
+text = "The seccomp filter's answer for every syscall either table names is checked against the tables by executing the program, not by inspecting it."
+where = ["CHANGELOG.md"]
+context = """
+Host-independent: the interpreter and the oracle are pure, so this runs on any machine,
+including one with no seccomp at all. It covers the filter's ENCODING — jump offsets,
+ordering, the architecture gate, the flag masks — and not what the filter ought to say,
+which is the end-to-end suite's question and is asked there against a real kernel.
+"""
+assumptions = [
+  "a shared misunderstanding is invisible to it: if the oracle and the builder are both wrong about what a syscall should do, they agree",
+]
+evidence = [
+  "test:the_filter_agrees_with_the_tables_on_every_syscall_it_knows",
+  "test:the_filter_reads_the_flags_out_of_the_right_argument",
+  "test:a_record_from_another_architecture_is_killed",
+  "test:an_x32_call_is_killed_rather_than_matched_against_the_x86_64_table",
+]
+checked = "2026-09-15"
+
+[[claim]]
+id = "a-parse-is-never-more-permissive-than-its-text"
+kind = "capability"
+text = "`Policy::parse` either fails, or grants a unit only what the document names and what the defaults already gave."
+where = ["CHANGELOG.md"]
+context = """
+Host-independent; `buildclamp-core` is pure. The oracle is a generic TOML walk that knows
+nothing about the typed structs, so it is a second opinion rather than a restatement.
+Break-glass is excluded from the property by construction: an exception naming no
+capabilities grants all of them by design, and `breakglass.rs` tests that rule directly.
+"""
+assumptions = [
+  "the oracle over-approximates over whole string values — a `why` whose entire text is a capability name counts — which makes the property weaker and never makes it wrong",
+]
+evidence = [
+  "test:a_parse_is_never_more_permissive_than_its_text",
+  "test:the_property_fails_on_a_policy_that_grants_what_the_text_does_not_name",
+]
+checked = "2026-09-15"
+
+[[claim]]
+id = "the-sandbox-crate-surface-is-frozen"
+kind = "capability"
+text = "`buildclamp-sandbox`'s published surface cannot change — in either direction — without a commit that says so."
+where = ["CHANGELOG.md"]
+context = """
+Two halves, because neither is sufficient. The compiler catches removals and signature
+changes, by using every frozen item at its exact type; a committed snapshot catches
+additions, which a compiler cannot see. `bpf` and `bpfcheck` are listed in the snapshot but
+deliberately NOT frozen — they exist so a reviewer can read and execute the filter, and a
+syscall added to the tables changes that surface.
+"""
+assumptions = [
+  "the snapshot is produced by reading declarations out of the source rather than from rustdoc JSON, which is nightly-only; it therefore over-lists, including items declared `pub` inside private modules, which is the safe direction",
+]
+evidence = [
+  "test:the_public_surface_matches_the_snapshot",
+  "test:plan_carries_exactly_these_fields_at_exactly_these_types",
+  "test:hold_error_has_exactly_these_variants",
+  "test:the_crate_refuses_rather_than_running_unheld_on_a_host_it_cannot_hold",
+]
+checked = "2026-09-15"
+
+[[claim]]
+id = "the-common-build-script-offenders-need-no-grant"
+kind = "capability"
+text = "The crates most likely to break under a default-deny build policy — cc, pkg-config, bindgen, vendored openssl, ring and the compression -sys crates — need no grant at all."
+where = ["docs/OPERATIONS.md", "docs/FIRST-RUN.md", "docs/POLICY.md", "CHANGELOG.md"]
+context = """
+Measured 2026-09-15 on Linux 6.18 with Landlock ABI 7, every capability at `enforced`,
+through `cargo buildclamp observe --deep` over a graph containing libc 0.2.189, libz-sys
+1.1.29, openssl-sys 0.9.117 with and without `vendored`, bindgen 0.71.1, ring 0.17.14,
+zstd-sys 2.1.0, lz4-sys 1.11.1, brotli-sys 0.3.2, blake3 1.8.7, proc-macro2 1.0.107, quote
+1.0.47, prettyplease 0.2.37 and clang-sys 1.9.1. Zero ungranted requests; `init` writes an
+empty grants table.
+"""
+assumptions = [
+  "fourteen crates chosen for being the common offenders is not a sample: the 200-crate sweep the plan calls for has not been run, and the documents say so where they publish the number",
+  "prost-build is named in the same list and was NOT measured — it needs a protoc the host did not have",
+  "a host that cannot reach the same tier may see different results; `doctor` and docs/MATRIX.md are how a reader checks their own",
+]
+evidence = ["test:an_ordinary_build_script_produces_no_ungranted_requests"]
+checked = "2026-09-15"
+
+[[claim]]
+id = "an-attestation-cannot-launder-the-documented-gaps"
+kind = "capability"
+text = "A statement over a run with `withhold-secret-reads` or `hold-compile-units` off reports `is_fully_enforced() == false`, whatever its tiers say."
+where = ["CHANGELOG.md", "docs/CONFIG.md"]
+context = """
+Host-independent; the predicate is a pure type in `buildclamp-core`. It is the rule that
+separates an attestation from a laundering machine: both of those runs produce tiers that
+all say `enforced:`, truthfully, about the capabilities that WERE held, while a build script
+could read every credential file on the host and no proc-macro was held at all. The same
+answer is false on an operator override, on one advisory capability among enforced ones, on
+an empty tier set, and once an erratum applies.
+"""
+assumptions = [
+  "the profile is a field in the signed document, so it says what the signer recorded; a signer that recorded it wrongly is a different problem, and the digest of the report it names is how a reader checks",
+]
+evidence = [
+  "test:a_run_with_read_deny_off_is_not_fully_enforced",
+  "test:a_run_with_compile_units_unheld_is_not_fully_enforced",
+  "test:one_advisory_unit_among_two_hundred_enforced_still_fails",
+  "test:every_vector_is_rejected_for_the_reason_it_names",
+]
+checked = "2026-09-15"
+
+[[claim]]
+id = "verify-reads-the-predicate-type-from-the-document"
+kind = "capability"
+text = "`cargo buildclamp verify` reads `predicateType` out of the statement rather than from a flag, and says on every run that it did not check the signature."
+where = ["CHANGELOG.md", "docs/CONFIG.md"]
+context = """
+CVE-2022-35929 is cosign returning success when no attestation of the requested type existed
+at all, because the type came from `--type`. There is no such flag here. The attestation
+signature is genuinely not checked — the free binary's only cryptography is `ring` verifying
+signed policy layers, a different document — and the command's own output says which half it
+did, on every run, pass or fail.
+"""
+assumptions = [
+  "a complete verification needs cosign or `gh attestation verify` for the signature; the published negative vectors are unsigned and say so, and cryptographic vectors belong wherever the signature is checked",
+]
+evidence = [
+  "test:every_vector_is_rejected_for_the_reason_it_names",
+  "test:the_positive_control_fails_once_a_digest_is_checked_against_the_wrong_file",
+]
+checked = "2026-09-15"
+
+[[claim]]
+id = "an-org-layer-can-only-narrow"
+kind = "capability"
+text = "A layer declaring `may-widen = false` is a ceiling: a layer above it that would confer more is refused before cargo starts, naming both files."
+where = ["docs/CONFIG.md", "docs/POLICY.md", "CHANGELOG.md"]
+context = """
+Host-independent; composition is a pure decision in `buildclamp-core`. The ceiling bounds
+every crate, including ones it never mentions — its answer for an unnamed crate is "the
+defaults". Refused rather than merged and rather than quietly narrowed: narrowing would
+leave the build passing, one file saying the crate has the capability, the envelope saying
+it does not, and nothing to tell a reader which.
+"""
+assumptions = [
+  "the up-front check sweeps versions derived from the requirements present, so a requirement whose only satisfying versions no candidate hits is caught per-unit instead — which is where it was caught before the sweep existed; `Stack::check` says so rather than implying completeness",
+]
+evidence = [
+  "test:a_repo_grant_that_exceeds_an_org_ceiling_is_a_hard_error_naming_both_files",
+  "test:a_ceiling_bounds_a_crate_it_never_mentions",
+  "test:a_repo_may_always_narrow",
+  "test:a_repo_grant_that_exceeds_the_org_ceiling_refuses_before_cargo_starts",
+  "test:the_org_ceiling_holds_in_the_process_that_does_the_holding",
+]
+checked = "2026-09-16"
+
+[[claim]]
+id = "a-version-one-policy-keeps-working"
+kind = "capability"
+text = "A policy written at format version 1 still parses, resolves the same envelopes, and needs no migration to keep a build working."
+where = ["docs/CONFIG.md", "CHANGELOG.md"]
+context = """
+Only the FUTURE is refused; the past is read and upgraded in memory on every run, and the
+file on disk is untouched until somebody runs `policy migrate`. A version bump that rejected
+every file in the field would make the tool the reason a build broke on the day it was
+upgraded, and the answer would be to pin it.
+"""
+assumptions = [
+  "`policy migrate` re-resolves every grant against the original before it writes, and refuses rather than produce a file whose meaning moved",
+]
+evidence = [
+  "test:a_version_one_policy_still_parses_and_is_upgraded_in_memory",
+  "test:the_pinned_v1_policy_still_parses_and_resolves_the_way_it_did",
+  "test:a_version_one_policy_still_builds_and_migrate_changes_only_the_number",
+]
+checked = "2026-09-16"
+
+[[claim]]
+id = "no-continue-decision-is-enforced"
+kind = "capability"
+text = "No capability decided by the seccomp notification supervisor (a CONTINUE answer) is reported as `enforced:`; those tiers are advisory, in the kernel's own words."
+where = ["CHANGELOG.md", "docs/CONFIG.md"]
+context = """
+Host-independent — the tiers are computed in `plan_tiers` and the rule is a source-level
+architecture invariant. `enforced:seccomp-errno` is exempt and must stay so: a classic-BPF
+errno is atomic, the kernel returns it and the syscall never runs. The rule keys on the
+mechanism string `notify`, not on `seccomp`, for exactly that reason. `doctor` quotes
+`seccomp_unotify(2)` verbatim wherever a capability falls to that tier.
+"""
+assumptions = [
+  "exec is observe-only: recorded through the notification supervisor and never refused, so its tier is advisory on every host and it is excluded from `--require-enforced` and from `--require` floors rather than making them unsatisfiable",
+]
+evidence = [
+  "test:no_enforced_tier_is_labelled_with_a_notification_mechanism",
+  "test:a_seccomp_errno_refusal_is_enforcement_but_a_notification_decision_is_not",
+  "test:doctor_on_a_host_with_neither_mechanism_says_what_that_means_for_the_user",
+  "test:an_observe_only_capability_cannot_be_named_in_a_floor",
+]
+checked = "2026-09-16"
+
+[[claim]]
+id = "exact-proc-macro-attribution-is-demonstrated"
+kind = "capability"
+text = "When a proc-macro reaches a syscall from its own compiled code, the report attributes the request to that macro by name at `exact` confidence, and does not name an innocent proc-macro that was in the same closure."
+where = ["README.md", "docs/adr/0004-proc-macro-attribution.md"]
+context = """
+The differentiating claim of the project, and it was effectively dead: attribution ran only
+against fabricated /proc maps in unit tests, never against a proc-macro that actually reached
+a syscall. An executing end-to-end test now drives one. `probemacro` issues `socket` from an
+inline `syscall` instruction compiled into its own `.so`, so the recorded instruction pointer
+falls inside `libprobemacro-*.so`; `quietmacro`, in the same closure, does nothing. The held
+compile names `probemacro` at `exact` and never names `quietmacro`. Precision on that
+one-probe corpus is 1.0, and the test is the gate — naming the wrong macro, or the innocent
+one, fails it and blocks the build. What is NOT measured is stated beside the claim in the
+ADR: the synthetic sweep, `stack-scan`'s precision, and the closure-size distribution.
+"""
+assumptions = [
+  "`stack-scan` is emitted but UNCLAIMED: no accuracy is published for it, so it is a labelled heuristic rather than a confidence level the project stands behind; the shipped, measured claim is `exact` only",
+]
+evidence = [
+  "test:a_held_compile_names_the_exact_proc_macro_that_reached_out",
+  "test:an_address_inside_a_proc_macro_names_that_macro",
+  "test:attribution_degrades_to_the_closure_when_the_process_is_gone",
+]
+checked = "2026-09-16"
+
+[[claim]]
+id = "laptop-side-enforcement-is-not-claimed"
+kind = "capability"
+text = "buildclamp does not hold IDE-triggered or interactive builds started outside `cargo buildclamp`; setting only `RUSTC_WRAPPER`, for example in `.cargo/config.toml`, holds nothing, so laptop-side enforcement is a documented non-goal and is not claimed in positioning until it ships."
+where = ["README.md"]
+context = """
+The developer-machine coverage spike, recorded as the dated non-goal the plan allows rather
+than a shipped mode. Measured: a bare `RUSTC_WRAPPER` set in `.cargo/config.toml` with a
+plain `cargo build` produces no report and holds nothing, because the wrapper passes a unit
+through whenever the driver's policy switch (`BUILDCLAMP_POLICY` / the run directory) is
+absent — by design, so that a stray `RUSTC_WRAPPER` in a shell cannot silently mutate a
+target directory. The manual four-variable path (`RUSTC_WRAPPER` + `BUILDCLAMP_POLICY` +
+`BUILDCLAMP_RUN` + `BUILDCLAMP_MODE`) does hold units but gets no sweep and no aggregated
+report, and the editor sets none of them; rust-analyzer additionally runs proc-macro
+expansion through its own server rather than rustc, which a rustc wrapper never sees. The
+IDE inner-loop latency the full spike would measure needs a real editor and is not measured
+in CI. So the honest status is a non-goal, and the coverage table says so per row.
+"""
+assumptions = [
+  "The four-variable manual path remains available and is documented under the coverage table's `partial, manual` row; it is not the shipped mechanism and does not change this non-goal",
+]
+evidence = [
+  "test:with_no_policy_active_the_wrapper_touches_nothing",
+]
+checked = "2026-09-16"
+
+[[claim]]
+id = "signed-policy-authority-is-verified"
+kind = "capability"
+text = "A distributed policy layer is accepted only when signed by a key in the repository's committed trust root; `--require-signed-policy` refuses an unsigned or wrongly-signed layer before the build starts, and the report and attestation record which key verified."
+where = ["docs/CONFIG.md", "SECURITY.md"]
+context = """
+`policy_sha256` proves a layer is byte-identical to what was recorded, which is integrity, not
+authority — a curl'd bundle hashes the same as a committed one. The trust root, committed in
+the repository under CODEOWNERS, supplies the authority: a detached `<layer>.sig` verified by
+Ed25519 (ring, verify-only). The committed anchor is never itself signature-checked — its
+authority is that it is committed — so this verifies the DISTRIBUTED layers it pulls in. The
+whole thing is a build-time content decision: no live fetch, and the failure is a refusal
+before cargo, not after a target directory is half written.
+"""
+assumptions = [
+  "Signing lives with the signer, air-gapped and outside this repository; this binary verifies and cannot sign. Distribution (a pull request, or a CI step that curls a signed bundle) happens outside the enforcing binary, which only ever verifies bytes already on disk.",
+]
+evidence = [
+  "test:a_signed_distributed_layer_verifies_and_the_report_names_the_signer",
+  "test:an_unsigned_distributed_layer_is_refused_under_require_signed_policy",
+  "test:a_layer_signed_by_an_untrusted_key_is_refused",
+  "test:an_unsigned_distributed_layer_is_recorded_and_refused_only_when_required",
+]
+checked = "2026-09-16"
+
+[[claim]]
+id = "no-vendor-trust-root-in-the-free-binary"
+kind = "capability"
+text = "cargo-buildclamp compiles in no vendor trust root: the key that verifies a policy signature is always the customer's, read from their committed policy, and the verification path makes no network request."
+where = ["SECURITY.md", "docs/CONFIG.md"]
+context = """
+A vendor key baked into the free binary would make a vendor's key rotation or lapse a
+customer's build outage, and would make the vendor an authority over what a customer's builds
+may do. So there is none. The one asymmetric-crypto implementation is ring (verify-only in
+the free binary), and the only hand-written primitive is the content-naming SHA-256; no
+ed25519-dalek, so a review counts one asymmetric library. This closes the
+conflict the SIGNALS review flagged as major — SECURITY.md's cryptography answer is now
+stated per artefact rather than as one sentence that was true of only one artefact.
+"""
+evidence = [
+  "test:no_ed25519_key_is_hardcoded_in_the_free_binary",
+  "test:the_verification_path_reads_from_disk_and_never_the_network",
+  "test:the_trust_root_is_built_from_customer_policy_data",
+]
+checked = "2026-09-16"
+
+[[claim]]
+id = "a-waived-build-is-not-fully-enforced"
+kind = "capability"
+text = "A build that passed only because a human broke glass carries the exercised exceptions as `waivers` in the signed statement, and `is_fully_enforced` returns false for it, whatever the tiers say."
+where = ["schemas/v1/attestation.schema.json", "CHANGELOG.md"]
+context = """
+Every tier can read `enforced:` and be true while an exception let one unit past the policy.
+enforcement_summary would not show it; a waiver does. Added in predicate format version 2 as
+required-reading — the emitter is the tempting place for this to break quietly, so the
+invariant has its own test. An exception a unit never exercised is not a waiver and does not
+taint a clean build.
+"""
+evidence = [
+  "test:a_build_broken_glass_on_is_not_fully_enforced_whatever_the_tiers_say",
+  "test:an_exception_nobody_exercised_is_not_a_waiver",
+]
+checked = "2026-09-16"
+
+[[claim]]
+id = "the-attestation-verifier-migrates-v1-to-v2"
+kind = "capability"
+text = "The attestation verifier accepts predicate format versions 1 and 2, refuses a version from the future rather than reading the parts it recognises, and refuses a version-1 statement after its stated sunset (2028-01-01) rather than silently."
+where = ["schemas/v1/attestation.schema.json", "CHANGELOG.md"]
+context = """
+The migration story written before the format is shipped, while the count of issued
+statements is near zero. A future version is refused because reading a newer document on the
+parts an older verifier understands is the permissive direction, wrong for a signature. v1 is
+read until its sunset and refused after, with an error that names the date, because a v1
+statement was valid when written and a format nobody re-issues is a format nobody audits. The
+verifier takes `today` as an argument — the pure crate has no clock — so the cutover is
+testable at any date.
+"""
+evidence = [
+  "test:the_current_version_is_two_and_it_verifies",
+  "test:the_verifier_reads_version_one_before_its_sunset_and_refuses_it_after",
+  "test:the_verifier_refuses_a_version_from_the_future",
+]
+checked = "2026-09-16"
+
+[[claim]]
+id = "the-report-is-not-an-sbom-and-claims-no-conformity"
+kind = "capability"
+text = "No output path emits a conformity claim or describes the capability report as an SBOM; the report is testing evidence, not CycloneDX, not SPDX, and carries no NTIA minimum elements, and the tool never says `CRA compliant` or maps to a clause number."
+where = ["docs/SSDF.md"]
+context = """
+The temptation a demand for CRA evidence creates: to let the tool's output describe itself as
+a bill of materials or assert a conformity status it cannot back. It does neither. The
+capability report is per-crate testing evidence — one of the four routes CRA Article 13(5)
+names — and the gate scans the OUTPUT paths (render, report, attestation) for the forbidden
+vocabulary as string literals, and a serialized report and predicate for it at runtime. The
+prose docs are deliberately NOT scanned: `docs/SSDF.md` discusses SBOMs and conformity to say
+what buildclamp is not, and banning the words there would ban the honesty.
+"""
+assumptions = [
+  "The CRA Annex VII evidence bundle itself is unbuilt: it is defined by what a named compliance owner will accept, so building it speculatively would be evidence in the wrong shape. This claim is only that the tool does not OVERCLAIM in the meantime.",
+]
+evidence = [
+  "test:no_output_path_emits_a_compliance_or_sbom_claim",
+  "test:a_serialized_report_and_predicate_carry_no_such_claim",
+]
+checked = "2026-09-16"
+
+[[claim]]
+id = "the-report-blob-is-byte-identical-round-trip"
+kind = "capability"
+text = "The report the tool writes serialises byte-identically across a round trip, so a store that keeps the blob verbatim and an auditor who re-derives it agree — the blob a customer audits is the blob they produced."
+where = ["CHANGELOG.md"]
+context = """
+The irreversible foundation any store of these reports would rest on, shipped in this
+tool and testable now without any server: such a store would keep the report blob verbatim,
+and this is what lets an auditor re-derive the canonical bytes and confirm the stored blob is
+the produced one. It holds only because serialisation is deterministic — every map is a
+BTreeMap, every set ordered — and the test uses the exact `to_vec_pretty` call the writer
+makes, so a field quietly becoming a HashMap breaks the build rather than the audit.
+"""
+evidence = [
+  "test:a_report_serialises_byte_identically_so_the_stored_blob_is_the_produced_blob",
+]
+checked = "2026-09-16"

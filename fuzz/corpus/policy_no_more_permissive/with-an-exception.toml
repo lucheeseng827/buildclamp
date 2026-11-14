@@ -1,0 +1,7 @@
+version = 1
+
+[[exception]]
+crate = "evil"
+expires = "2026-09-20"
+reason = "r"
+author = "a@example.com"

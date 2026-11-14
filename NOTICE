@@ -1,0 +1,74 @@
+buildclamp
+Copyright 2026 The buildclamp authors
+
+This product includes software developed by the buildclamp authors.
+
+Licensed under the Apache License, Version 2.0 (the "License"); you may not use this file
+except in compliance with the License. You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software distributed under the
+License is distributed on an "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND,
+either express or implied. See the License for the specific language governing permissions
+and limitations under the License.
+
+--------------------------------------------------------------------------------
+
+Prior art this project builds on, and owes.
+
+  cargo-acl (formerly cackle)     https://github.com/cackle-rs/cackle
+    David Lattimore. MIT OR Apache-2.0.
+
+    The nearest existing tool and a direct predecessor. It arrived at the same
+    interception mechanism — RUSTC_WRAPPER, and replacing a compiled build script with a
+    shell script — independently and years earlier, and it pairs that with static
+    reachability analysis over compiled object code that buildclamp does not attempt at
+    all. No buildclamp code is derived from it; the debt is to the design.
+
+  @lavamoat/allow-scripts          https://github.com/LavaMoat/LavaMoat
+    MetaMask. The npm ecosystem's answer to the same problem — dependency lifecycle scripts
+    disabled by default, with an explicit allowlist — and the closest conceptual ancestor
+    of this idea anywhere.
+
+  birdcage                         https://github.com/phylum-dev/birdcage
+    Phylum, GPL-3.0-or-later, archived 2026-07-06. Not used and not linked: its licence is
+    incompatible with this one. Its shape — namespaces plus a syscall allowlist, with a
+    capability enum rather than a permission bag — informed this design, and
+    docs/adr/0003 records the four independent reasons it is not a dependency.
+
+--------------------------------------------------------------------------------
+
+Written deliberately in-tree rather than taken from a dependency:
+
+  the classic-BPF seccomp filter and its builder    crates/sandbox/src/linux/bpf.rs
+  the seccomp user-notification supervisor          crates/sandbox/src/linux/seccomp.rs
+  the namespace setup and the capability lock       crates/sandbox/src/linux/ns.rs
+  per-proc-macro attribution                        crates/sandbox/src/linux/attribution.rs
+
+The filter is a few dozen fixed instructions and it is the thing standing between cargo and
+a third party's code. A reviewer who does not trust buildclamp has to be able to read it,
+and a dependency that generated it would move the thing being audited out of the
+repository. `seccompiler` and `libseccomp` are both good crates; that is the reason
+neither is used here.
+
+--------------------------------------------------------------------------------
+
+Referenced, implemented from public documentation, not derived from any implementation:
+
+  seccomp-BPF and SECCOMP_RET_USER_NOTIF   Linux kernel userspace-api documentation
+  Landlock                                 https://landlock.io
+  user, mount, PID and network namespaces  Linux kernel documentation
+  the new mount API (open_tree, move_mount, mount_setattr)   Linux 5.2+ / 5.12+
+
+--------------------------------------------------------------------------------
+
+The August 2026 supply-chain compromise this tool responds to is described in the Rust
+Security Response Team's post-mortem, in RUSTSEC-2026-0260, and in analyses by Socket and
+StepSecurity.
+
+--------------------------------------------------------------------------------
+
+Third-party dependencies retain their own licences. `cargo deny list` in a release build
+prints the full set; the CycloneDX SBOM published with each release is the authoritative
+record for that release.

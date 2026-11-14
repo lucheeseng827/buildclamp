@@ -1,0 +1,7 @@
+[package]
+name = "evil"
+version = "0.1.3"
+edition = "2021"
+publish = false
+build = "build.rs"
+description = "Test fixture: a build script that does what proc-macro1 did, against loopback."

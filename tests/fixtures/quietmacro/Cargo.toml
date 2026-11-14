@@ -1,0 +1,8 @@
+[package]
+name = "quietmacro"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Test fixture: a benign proc-macro that does nothing at expansion time, present in the same closure as probemacro so `exact` attribution can be shown to name the culprit and NOT this one."
+[lib]
+proc-macro = true

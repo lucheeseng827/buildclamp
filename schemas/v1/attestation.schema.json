@@ -1,0 +1,142 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://buildclamp.dev/attestation/v1",
+  "title": "buildclamp attestation predicate v1",
+  "description": "The predicate body of an in-toto Statement v1 produced by buildclamp. It states that an artefact with a given content hash was built while a given policy and a given report were in effect, and which enforcement tier actually applied on the build host. It does NOT state that the enforcement was correct, that the policy was a good one, or that the build was reproducible. This file is normative; the $id is an identifier and is never fetched.",
+  "type": "object",
+  "required": [
+    "format_version",
+    "artefact_name",
+    "artefact_sha256",
+    "policy_sha256",
+    "report_sha256",
+    "enforcement_summary",
+    "units_held",
+    "ungranted_requests",
+    "enforcement_profile",
+    "scope",
+    "built_at",
+    "key_id"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "format_version": {
+      "type": "integer",
+      "enum": [1, 2],
+      "description": "1 or 2. Version 2 adds `waivers` and makes it required reading (a waived build is not fully enforced). A verifier accepts both; it refuses a version-1 statement after the stated sunset (2028-01-01), because a format nobody re-issues is a format nobody audits."
+    },
+    "artefact_name": {
+      "type": "string",
+      "description": "A name, never a path: a path is meaningless on the machine that verifies this."
+    },
+    "artefact_sha256": { "$ref": "#/$defs/sha256" },
+    "policy_sha256": {
+      "$ref": "#/$defs/sha256",
+      "description": "Two builds under 'the same policy' that hash differently were not under the same policy."
+    },
+    "policy_signature_verified": {
+      "type": "boolean",
+      "description": "Whether every distributed policy layer verified against the repository's committed trust root — the policy's AUTHORITY (who was allowed to write it), which policy_sha256 alone cannot establish. False when no trust root is in use or a layer was unsigned. Optional and additive: a v1 document written before this field is read with it false."
+    },
+    "policy_signer_key_id": {
+      "type": "string",
+      "description": "The trust-root key id(s) that signed the distributed layers, when any did; several are joined by commas across a rotation window or multiple layers. Absent when nothing was verified."
+    },
+    "report_sha256": { "$ref": "#/$defs/sha256" },
+    "enforcement_summary": {
+      "type": "object",
+      "description": "The WEAKEST tier seen for each capability across every unit in the run. Weakest, not last or strongest: one advisory unit among two hundred enforced is the single most useful thing this document can tell a reader.",
+      "additionalProperties": {
+        "type": "string",
+        "pattern": "^(enforced:|advisory:|none|unrecognised:)"
+      }
+    },
+    "units_held": { "type": "integer", "minimum": 0 },
+    "ungranted_requests": { "type": "integer", "minimum": 0 },
+    "operator_overrides": {
+      "type": "array",
+      "description": "Enforcement an operator switched off or down. Non-empty means is_fully_enforced() is false, whatever the tiers say: a switched-off mechanism leaves behind either nothing or a weaker one still reporting 'enforced:'.",
+      "items": { "type": "string" }
+    },
+    "enforcement_profile": { "$ref": "#/$defs/enforcementProfile" },
+    "scope": { "$ref": "#/$defs/scope" },
+    "waivers": {
+      "type": "array",
+      "description": "Gates a human waived with break-glass: exceptions a unit actually exercised. Added in format version 2. A non-empty array means the build was let through by an override and is NOT fully enforced, whatever the tiers say. Optional and omitted when empty, so a version-1 document has none.",
+      "items": {
+        "type": "object",
+        "required": ["unit", "capabilities", "reason", "author", "expires"],
+        "properties": {
+          "unit": {
+            "type": "object",
+            "required": ["name", "version"],
+            "properties": {
+              "name": { "type": "string" },
+              "version": { "type": "string" }
+            }
+          },
+          "capabilities": { "type": "array", "items": { "type": "string" } },
+          "reason": { "type": "string" },
+          "author": { "type": "string" },
+          "expires": { "type": "string" }
+        }
+      }
+    },
+    "built_at": { "type": "string", "format": "date-time" },
+    "key_id": { "type": "string" }
+  },
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$",
+      "description": "Lowercase hex, unprefixed."
+    },
+    "enforcementProfile": {
+      "type": "object",
+      "description": "Every optional enforcement flag and its state. Without this a run with both hardenings off produces a statement whose every tier says 'enforced:' — truthfully, about the capabilities that were held — and a reader concludes 'fully enforced' about a build where a build script could read every credential file on the host and no proc-macro was held at all.",
+      "required": [
+        "read_deny",
+        "compile_units_held",
+        "net_destinations_recorded_only"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "read_deny": {
+          "type": "boolean",
+          "description": "`withhold-secret-reads`. False means every unit could read every path on the host."
+        },
+        "read_deny_ruleset_sha256": {
+          "$ref": "#/$defs/sha256",
+          "description": "Which deny-list was in force. The list changes between releases, so 'read_deny was on' does not by itself say which paths were withheld. Absent when read_deny is false."
+        },
+        "compile_units_held": {
+          "type": "boolean",
+          "description": "`hold-compile-units`. False means proc-macro expansion ran unheld — the half of the threat a build-script-only tool misses entirely."
+        },
+        "net_destinations_recorded_only": {
+          "type": "boolean",
+          "const": true,
+          "description": "Always true, and recorded anyway: a reader must not have to know this project's documentation to find out that a destination list is not a control."
+        },
+        "landlock_abi_used": {
+          "type": ["integer", "null"],
+          "description": "The ABI the run used, or absent where Landlock was unavailable. ABI is a tier dimension: landlock-v1 cannot restrict truncation."
+        },
+        "disable_overrides": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Repeated from operator_overrides so this object stands alone: a consumer reading only the profile must not be able to conclude 'everything on' about a run somebody had switched down."
+        }
+      }
+    },
+    "scope": {
+      "type": "object",
+      "description": "What was NOT held, in words. Distinct from enforcement_profile, which is a list of switches; this is the sentence somebody reads. An empty list is a claim that there were no gaps, not the absence of a claim.",
+      "required": ["not_held"],
+      "additionalProperties": true,
+      "properties": {
+        "not_held": { "type": "array", "items": { "type": "string" } }
+      }
+    }
+  }
+}

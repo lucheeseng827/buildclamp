@@ -1,0 +1,9 @@
+[package]
+name = "macrouser"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "Test fixture: the consumer crate whose compilation expands evilmacro."
+
+[dependencies]
+evilmacro = { path = "../evilmacro" }

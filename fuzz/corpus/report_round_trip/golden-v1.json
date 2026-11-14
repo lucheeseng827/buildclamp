@@ -1,0 +1,197 @@
+{
+  "format_version": 1,
+  "tool_version": "0.1.0",
+  "mode": "observe",
+  "cargo_command": [
+    "check"
+  ],
+  "host": {
+    "os": "linux",
+    "kernel": "6.18.0-golden",
+    "arch": "x86_64",
+    "landlock_abi": null,
+    "user_namespaces": true,
+    "seccomp_user_notif": true,
+    "proc_hidepid": false
+  },
+  "units": [
+    {
+      "id": {
+        "name": "benign",
+        "version": "0.1.0"
+      },
+      "kind": "build-script-compile",
+      "instance": "benign-bca10871d2ff0757",
+      "envelope": {
+        "granted": [
+          "unix",
+          "fs-write",
+          "exec"
+        ],
+        "write_zones": [
+          "out-dir",
+          "tmp"
+        ],
+        "write_paths": [],
+        "env_allow": [],
+        "net_destinations": [],
+        "source": {
+          "kind": "default"
+        },
+        "why": null,
+        "reviewed": true
+      },
+      "tiers": [
+        [
+          "net",
+          {
+            "grade": "none",
+            "reason": "observe mode: recorded, nothing enforced"
+          }
+        ],
+        [
+          "unix",
+          {
+            "grade": "none",
+            "reason": "observe mode: recorded, nothing enforced"
+          }
+        ],
+        [
+          "fs-write",
+          {
+            "grade": "none",
+            "reason": "observe mode: recorded, nothing enforced"
+          }
+        ],
+        [
+          "env-secret",
+          {
+            "grade": "none",
+            "reason": "observe mode: recorded, nothing enforced"
+          }
+        ],
+        [
+          "exec",
+          {
+            "grade": "none",
+            "reason": "observe mode: recorded, nothing enforced"
+          }
+        ]
+      ],
+      "env_scrubbed": [],
+      "requests": [
+        {
+          "at_ms": 4,
+          "tid": 20412,
+          "capability": "fs-write",
+          "syscall": "openat",
+          "target": "/w/target/debug/build/benign-bca10871d2ff0757/out/table.rs",
+          "outcome": {
+            "outcome": "granted"
+          },
+          "attribution": {
+            "confidence": "unit"
+          }
+        },
+        {
+          "at_ms": 4,
+          "tid": 20412,
+          "capability": "fs-write",
+          "syscall": "mkdir",
+          "target": "/w/target/debug/build/benign-bca10871d2ff0757/out/objs",
+          "outcome": {
+            "outcome": "granted"
+          },
+          "attribution": {
+            "confidence": "unit"
+          }
+        },
+        {
+          "at_ms": 4,
+          "tid": 20412,
+          "capability": "fs-write",
+          "syscall": "openat",
+          "target": "/w/target/debug/build/benign-bca10871d2ff0757/out/objs/stub.o",
+          "outcome": {
+            "outcome": "granted"
+          },
+          "attribution": {
+            "confidence": "unit"
+          }
+        },
+        {
+          "at_ms": 4,
+          "tid": 20412,
+          "capability": "fs-write",
+          "syscall": "openat",
+          "target": "/w/target/debug/build/benign-bca10871d2ff0757/out/table.rs.tmp",
+          "outcome": {
+            "outcome": "granted"
+          },
+          "attribution": {
+            "confidence": "unit"
+          }
+        },
+        {
+          "at_ms": 4,
+          "tid": 20412,
+          "capability": "fs-write",
+          "syscall": "rename",
+          "target": "/w/target/debug/build/benign-bca10871d2ff0757/out/table.rs.tmp",
+          "outcome": {
+            "outcome": "granted"
+          },
+          "attribution": {
+            "confidence": "unit"
+          }
+        },
+        {
+          "at_ms": 5,
+          "tid": 20413,
+          "capability": "exec",
+          "syscall": "execve",
+          "target": "/usr/bin/cc",
+          "outcome": {
+            "outcome": "granted"
+          },
+          "attribution": {
+            "confidence": "unit"
+          }
+        },
+        {
+          "at_ms": 7,
+          "tid": 20412,
+          "capability": "fs-write",
+          "syscall": "openat",
+          "target": "/w/target/debug/build/benign-bca10871d2ff0757/out/.buildclamp-tmp/benign-probe-20412",
+          "outcome": {
+            "outcome": "granted"
+          },
+          "attribution": {
+            "confidence": "unit"
+          }
+        },
+        {
+          "at_ms": 7,
+          "tid": 20412,
+          "capability": "fs-write",
+          "syscall": "unlink",
+          "target": "/w/target/debug/build/benign-bca10871d2ff0757/out/.buildclamp-tmp/benign-probe-20412",
+          "outcome": {
+            "outcome": "granted"
+          },
+          "attribution": {
+            "confidence": "unit"
+          }
+        }
+      ],
+      "observed": [
+        "fs-write",
+        "exec"
+      ],
+      "exit_code": 0,
+      "signal": null,
+      "duration_ms": 7
+    }
+  ]
+}

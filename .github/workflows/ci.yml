@@ -1,0 +1,368 @@
+# buildclamp CI — mirror-native.
+#
+# Published to the public mirror as .github/workflows/ci.yml, so every path is relative to
+# the repository root rather than to a monorepo module.
+#
+# The gates that matter are the last two jobs. Format, lint and unit tests catch ordinary
+# mistakes. Only the fixture gate catches the two mistakes that would make this tool worse
+# than nothing: letting the malicious build script through, and breaking the honest one.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # A build we sell into security teams should not resolve anything it was not told to.
+  CARGO_NET_GIT_FETCH_WITH_CLI: "true"
+  RUSTFLAGS: "-D warnings"
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: fmt · clippy · test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: install toolchain
+        run: |
+          rustup toolchain install 1.94.0 --profile minimal --component rustfmt,clippy
+          rustup default 1.94.0
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --all -- --check
+      # --all-targets so tests are linted too. A warning in a test is a warning somebody
+      # has to triage.
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # --locked: the lockfile in the repository is the build, not a suggestion. It matters
+      # more here than usual — this tool's whole subject is what a build resolves and then
+      # executes, and floating our own dependency versions would be the joke telling itself.
+      - run: cargo test --workspace --locked
+
+      # Measured, not aspirational. 1.91.0 is the floor the committed lock actually
+      # resolves against: clap_lex needs edition 2024 (1.85+) and cargo-platform declares
+      # 1.91. An earlier version of this job claimed 1.82 and would have failed on its
+      # first run — a green MSRV job that never ran the compiler is worse than none.
+      - name: msrv
+        run: |
+          rustup toolchain install 1.91.0 --profile minimal
+          cargo +1.91.0 check --workspace --locked
+
+  fixtures:
+    name: the two gates that matter
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.94.0 --profile minimal && rustup default 1.94.0
+      - uses: Swatinem/rust-cache@v2
+
+      # Ubuntu 24.04 — which is what `ubuntu-latest` resolves to — ships
+      # kernel.apparmor_restrict_unprivileged_userns=1, denying unprivileged
+      # CLONE_NEWUSER. Without a user namespace the tool cannot reach its enforcing tier,
+      # the tests below decline to assert, and this gate fails on a property of the runner
+      # image rather than of the code. `|| true`: an image that already permits it, or one
+      # with no such sysctl, must not fail the job. The `doctor` step is what answers
+      # whether it took.
+      - name: give the runner unprivileged user namespaces
+        run: |
+          set -uo pipefail
+          echo "before: $(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>&1 || echo '(absent)')"
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          echo "after:  $(sysctl -n kernel.apparmor_restrict_unprivileged_userns 2>&1 || echo '(absent)')"
+
+      # What this host can actually enforce, printed before anything is asserted. A green
+      # run on a runner that could not enforce would be exactly the false assurance the
+      # tool exists to avoid, so the log says which tier applied.
+      - name: what this runner can enforce
+        run: cargo run --locked -p cargo-buildclamp -- buildclamp doctor
+
+      # The lane DECLARES its floor, and fails as a misconfigured lane if it cannot reach
+      # it — before a single test runs.
+      #
+      # The step above prints what the runner can enforce; a human reading the log would
+      # notice a missing mechanism, and no human reads a green log. This turns the same
+      # facts into an exit code. It matters most for the failure that is otherwise silent:
+      # a runner image change that takes user namespaces away leaves every gate below
+      # green, because advisory enforcement still runs the build and the fixtures are
+      # still refused by the seccomp rung. The lane would go on reporting success while
+      # testing something weaker than it says it tests.
+      #
+      # The floor is the four capabilities this lane's default policy actually enforces, and
+      # they are named rather than folded into a bare `enforced`. net, unix, fs-write and
+      # env-secret are deny-by-default: an enforcing run holds every one, so a runner that
+      # quietly lost user namespaces would drop them from `enforced` and fail this step —
+      # the silent regression it exists to catch. The number is here, in writing, where the
+      # next person sees it.
+      #
+      # It is NOT `--require enforced`, and that is the honest choice, not a lowered bar. A
+      # bare floor means every capability buildclamp can refuse, which includes fs-read —
+      # and fs-read is allow-by-default: reads are unrestricted unless a policy sets
+      # `withhold-secret-reads`, which this lane does not. So `doctor` truthfully projects
+      # fs-read as `none` ("the policy withholds no reads"), and a bare floor would fail on
+      # every host, forever, over a capability this lane never asked to enforce. exec is out
+      # for the adjacent reason: it is observe-only and enforceable nowhere. Requiring the
+      # four we hold is the floor; requiring five we do not would be the overclaim this tool
+      # exists to refuse.
+      - name: this lane declares the enforcement floor it needs
+        run: cargo run --locked -p cargo-buildclamp -- buildclamp doctor --require net=enforced,unix=enforced,fs-write=enforced,env-secret=enforced
+
+      # buildclamp's own artefact boundary, checked at run time on this machine rather
+      # than against the dependency graph. `no-network-closure.sh` in the invariants job
+      # is the linking half; this is the behavioural half, and the two prove different
+      # things — a closure check cannot see what a binary does, and this cannot see a code
+      # path nothing exercised. ADR-0005 states the narrow claim both serve.
+      - name: buildclamp opens no socket while doing its own work
+        run: cargo run --locked -p cargo-buildclamp -- buildclamp selftest --no-network
+
+      # Gate 1: the malicious fixture is stopped, and named.
+      # Gate 2: the benign fixture produces ZERO ungranted requests.
+      #
+      # Both are in one suite because they fail in opposite directions and a change that
+      # fixes one usually breaks the other. A default-deny policy that breaks cc, bindgen
+      # and pkg-config on the first run is as fatal as letting the dropper through.
+      #
+      # A skip fails this gate, and only this gate. On a developer laptop a missing
+      # kernel feature should not read as a broken build, so the tests skip. Here the
+      # check's name is a promise: measured on a GitHub runner, all seven tests printed
+      # "SKIP: this host has no user namespaces" and the suite reported "7 passed", so
+      # the gate was green having asserted nothing — the false assurance this whole tool
+      # exists to prevent, wearing a green tick.
+      - name: fixture gates
+        run: |
+          set -euo pipefail
+          out=$(cargo test --locked -p cargo-buildclamp --test endtoend -- --nocapture --test-threads=2 2>&1) \
+            || { printf '%s\n' "$out"; exit 1; }
+          printf '%s\n' "$out"
+          if printf '%s\n' "$out" | grep -q 'SKIP:'; then
+            echo "::error::the end-to-end gate skipped at least one test, so its pass proves nothing"
+            exit 1
+          fi
+
+      # The enforcement primitives against real processes, including the fallback tiers,
+      # which BUILDCLAMP_DISABLE makes reachable on a runner that has everything.
+      #
+      # `--test-threads=1` is required rather than tidy: the Landlock test sets
+      # BUILDCLAMP_DISABLE=ns to prove the refusal is Landlock's and not the mount
+      # namespace's, and that variable is process-wide. Run concurrently, another test in
+      # this binary would see it and assert against the wrong tier.
+      #
+      # A SKIP is a failure here for the same reason it is in the fixture gate above: these
+      # tests decline to assert on a host that lacks the mechanism, so a run that skipped
+      # reports "passed" having proved nothing. The Landlock rung in particular cannot be
+      # exercised on this project's development host at all, which leaves CI as the only
+      # place a mistake in it is catchable — and silently skipping is how that would be
+      # missed.
+      - name: enforcement
+        run: |
+          set -euo pipefail
+          out=$(cargo test --locked -p buildclamp-sandbox --test enforcement \
+                  -- --nocapture --test-threads=1 2>&1) \
+            || { printf '%s\n' "$out"; exit 1; }
+          printf '%s\n' "$out"
+          if printf '%s\n' "$out" | grep -q 'SKIP:'; then
+            echo "::error::an enforcement primitive skipped, so this gate proved less than it claims."
+            echo "::error::The 'what this runner can enforce' step above says which mechanism is missing."
+            exit 1
+          fi
+
+  invariants:
+    name: architecture invariants
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.94.0 --profile minimal && rustup default 1.94.0
+      - uses: Swatinem/rust-cache@v2
+
+      - name: the policy core stays pure
+        run: |
+          set -e
+          # `cargo test -p buildclamp-core` must be a complete test of every policy
+          # decision on a machine with no Landlock, no namespaces and no seccomp. That is
+          # not hypothetical: this project's own development host has no Landlock at all.
+          for banned in libc landlock cargo_metadata tokio; do
+            if grep -qE "^\s*${banned}\b" crates/core/Cargo.toml; then
+              echo "::error::crates/core must not depend on ${banned} — its purity is what"
+              echo "::error::makes every policy decision testable without a kernel feature"
+              exit 1
+            fi
+          done
+          grep -q '#!\[forbid(unsafe_code)\]' crates/core/src/lib.rs
+          grep -q '#!\[forbid(unsafe_code)\]' crates/shim/src/lib.rs
+
+      - name: unsafe lives only in the sandbox crate
+        run: |
+          set -euo pipefail
+          # Two exclusions, both of which an earlier version of this check got wrong and
+          # failed on: `unsafe_code` is the lint name in `#![forbid(unsafe_code)]`, which
+          # is the line that proves the invariant rather than breaking it; and a line
+          # whose content begins with a comment marker is prose. The `file:line:` prefix
+          # grep adds is stripped before the comment test, or every line looks like code.
+          hits=$(grep -rnE '\bunsafe\b' crates/core/src crates/shim/src crates/cli/src \
+            | grep -vE '\bunsafe_code\b' \
+            | grep -vE '^[^:]+:[0-9]+:[[:space:]]*(//|/\*|\*)' || true)
+          if [ -n "$hits" ]; then
+            echo "::error::unsafe appeared outside crates/sandbox"
+            printf '%s\n' "$hits"
+            exit 1
+          fi
+          echo "OK — every unsafe block is in crates/sandbox."
+
+      - name: no HTTP client anywhere in this repository
+        run: |
+          # A tool that denies build scripts the network must not itself be able to reach
+          # it, and a reader must be able to establish that from `cargo tree` rather than
+          # from a promise.
+          if grep -rniE "^(reqwest|ureq|isahc|curl|surf|hyper)\s*=" --include=Cargo.toml .; then
+            echo "::error::an HTTP client was added. Nothing in buildclamp phones home."
+            exit 1
+          fi
+
+      # The same property over the RESOLVED GRAPH, which the grep above cannot see. Both
+      # run: the grep catches a library crate gaining a client before anything reachable
+      # depends on it, and this catches the three forms the grep misses —
+      # `reqwest.workspace = true`, an indented dependency under a target table, and a
+      # wrapper crate that pulls hyper transitively. Measured; see ADR-0005.
+      # Every commit carries a Developer Certificate of Origin sign-off. Not a CLA: a
+      # contributor licence agreement reads as a rights grab however it is worded, and
+      # this project does not ask contributors to assign their rights.
+      #
+      # `|| true` on the merge-base lookup and a skip on a shallow checkout, because a
+      # DCO check that fails on a clone depth rather than on a missing sign-off teaches
+      # contributors that the gate is noise.
+      - name: every commit is signed off
+        if: github.event_name == 'pull_request'
+        run: |
+          set -uo pipefail
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          if ! git cat-file -e "$base" 2>/dev/null; then
+            echo "the base commit is not in this checkout; skipping rather than failing on clone depth"
+            exit 0
+          fi
+          missing=0
+          for c in $(git rev-list "$base..$head"); do
+            if ! git show -s --format=%B "$c" | grep -qiE '^Signed-off-by: .+ <.+@.+>'; then
+              echo "::error::$c has no Signed-off-by line. \`git commit -s\`, or \`git rebase --signoff $base\` for a series."
+              missing=1
+            fi
+          done
+          exit $missing
+
+      - name: no network client in any published binary
+        run: ./ops/no-network-closure.sh
+
+      # The gate proves itself before it is trusted: it builds a binary that reaches a
+      # crate named `hyper` only transitively, asserts the grep does NOT see it, and
+      # asserts this check does. A gate never observed to fail is not a gate.
+      - name: and that check can actually fail
+        run: ./ops/no-network-closure.sh --selftest
+
+      # An architecture invariant: no CONTINUE-based
+      # (seccomp-notify) decision may be labelled `enforced:`. It is a source scan, because
+      # the mislabel it exists for lived on the exec row for two years while a behavioural
+      # test that only checked net and fs-write stayed green. Run in the normal test job
+      # below too; named here so a reviewer of the CI file can see the rule exists.
+      - name: no CONTINUE decision is promoted to enforced
+        run: cargo test --locked -p buildclamp-sandbox --test no_continue_is_enforced
+
+      # The fuzz targets, type-checked on STABLE. Running them needs nightly and libFuzzer;
+      # this only asserts that they still call functions the library has, which is the way
+      # a target rots — the property moves or is renamed, the target stops compiling, and
+      # nobody notices until somebody with nightly installed tries to run it.
+      - name: the fuzz targets still compile against the library
+        working-directory: fuzz
+        run: cargo check --locked
+
+      # A syscall the sandbox issues and the additions file does not name is a container
+      # that reports a weaker tier than its kernel offers — and the symptom is
+      # indistinguishable from an old kernel, so nobody investigates. The check reads the
+      # sandbox source rather than a specification, which is what keeps it true when a new
+      # syscall lands.
+      - name: the container seccomp delta names every syscall the sandbox issues
+        run: ./ops/make-seccomp-profile.sh --check
+
+      # And one row of the enforcement matrix, from the runner this job is on, so the
+      # generator is exercised by CI rather than only by whoever wrote it. The row is
+      # printed rather than asserted: a GitHub runner's capabilities are the runner's to
+      # decide, and a job that failed when they changed would be asserting something this
+      # project does not control.
+      - name: the matrix generator produces a row for this runner
+        run: |
+          cargo build --release --locked
+          BUILDCLAMP=./target/release/cargo-buildclamp ./ops/matrix-row.sh \
+            --markdown --label "GitHub Actions ${{ runner.os }} ${{ runner.arch }}"
+
+      - name: the fixtures are never workspace members
+        run: |
+          # They are deliberately hostile packages. A `cargo build` that included them
+          # would be a remote code execution vulnerability in our own build.
+          if grep -q 'tests/fixtures' Cargo.toml && ! grep -q 'exclude.*tests/fixtures' Cargo.toml; then
+            echo "::error::tests/fixtures must be excluded from the workspace, never a member"
+            exit 1
+          fi
+
+  oss-stands-alone:
+    name: the tool builds and tests standalone
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # clippy: `cargo test --workspace` runs crates/cli/tests/verbs.rs, which calls `cargo clippy`.
+      - run: rustup toolchain install 1.94.0 --profile minimal --component clippy && rustup default 1.94.0
+      - uses: Swatinem/rust-cache@v2
+      # The promise is that this tool is complete as published: nothing outside this
+      # repository is a build or test dependency, so a clean checkout on its own must
+      # build and pass. That is tested by building this tree as it stands, with no
+      # sibling tree present, rather than by reading the manifests.
+      - name: build and test everything in this tree
+        run: |
+          cargo build --workspace --locked
+          cargo test --workspace --locked
+
+      # No licence check may gate the tool. `Envelope::permits` is a policy method
+      # answering a different question, so the grep names the shape of a licence
+      # check — an entitlement type or a feature gate — rather than that word.
+      - name: no licence check anywhere in the tool
+        run: |
+          if grep -rn 'Entitlement\|licence::Feature' crates/ --include='*.rs'; then
+            echo "::error::a licence check has appeared in the tool"
+            exit 1
+          fi
+          echo "OK — no licence check in the tool."
+
+  supplychain:
+    name: cargo-deny · audit · sbom
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.94.0 --profile minimal && rustup default 1.94.0
+      - uses: Swatinem/rust-cache@v2
+
+      # A tool about build-time supply chain that did not check its own would be difficult
+      # to defend in the first conversation with anyone.
+      - name: cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans licenses sources
+
+      - name: cargo-audit
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit --deny warnings
+
+      - name: cyclonedx sbom
+        run: |
+          cargo install cargo-cyclonedx --locked
+          cargo cyclonedx --format json --all
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sbom
+          path: "**/*.cdx.json"

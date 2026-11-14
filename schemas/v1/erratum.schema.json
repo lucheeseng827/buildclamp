@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://buildclamp.dev/erratum/v1",
+  "title": "buildclamp erratum predicate v1",
+  "description": "A signed correction: statements matching these criteria overstate a tier, because of this finding. A signed statement is immutable and may be read in 2036; if a release is later found to have overstated a tier, every statement it signed is wrong and there is no way to unsign one. This is how that is corrected. Apache-2.0 and in this tool deliberately: a correction channel only the vendor's own customers could use would not be a correction channel. This file is normative; the $id is an identifier and is never fetched.",
+  "type": "object",
+  "required": ["format_version", "id", "matches", "corrected_tier", "finding", "published"],
+  "additionalProperties": true,
+  "properties": {
+    "format_version": { "type": "integer", "const": 1 },
+    "id": {
+      "type": "string",
+      "description": "A stable identifier, so a verifier can say which correction applied."
+    },
+    "matches": { "$ref": "#/$defs/matches" },
+    "capability": {
+      "type": ["string", "null"],
+      "description": "The capability whose tier was overstated, or absent for a whole-statement finding."
+    },
+    "corrected_tier": {
+      "type": "string",
+      "description": "What the tier should be read as instead."
+    },
+    "finding": { "type": "string" },
+    "published": { "type": "string", "format": "date-time" }
+  },
+  "$defs": {
+    "matches": {
+      "type": "object",
+      "description": "Every field present must match. An erratum with NO criteria matches NOTHING rather than everything — the permissive reading of an empty filter would let one malformed document invalidate every attestation a customer holds. An erratum matching nothing is legal: a correction published before anyone has built with the affected release corrects nothing yet and must still be publishable.",
+      "additionalProperties": true,
+      "properties": {
+        "key_id": { "type": ["string", "null"] },
+        "built_at_from": {
+          "type": ["string", "null"],
+          "format": "date-time",
+          "description": "Inclusive lower bound."
+        },
+        "built_at_before": {
+          "type": ["string", "null"],
+          "format": "date-time",
+          "description": "Exclusive upper bound."
+        },
+        "artefact_sha256": {
+          "type": ["string", "null"],
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    }
+  }
+}

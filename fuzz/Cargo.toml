@@ -1,0 +1,60 @@
+# The fuzz targets. A SEPARATE workspace, not a member of the one above.
+#
+# Two reasons, and the second is the one that matters here. `cargo-fuzz` requires a nightly
+# toolchain and links libFuzzer, and a member crate carrying that requirement would make
+# `cargo test` at the root fail on the stable toolchain this project pins — the same reason
+# `tests/fixtures` is excluded. And the targets are built by OSS-Fuzz with its own flags,
+# against its own builder image, which needs them standalone.
+#
+# The properties themselves are NOT here. They are library functions in
+# `buildclamp-core::fuzzcheck` and `buildclamp-sandbox::bpfcheck`, called from `cargo test`
+# over a seeded corpus on every commit and from libFuzzer over an unbounded one where it is
+# installed. A property that lived only in this directory would be a check that runs where
+# somebody has set up nightly and nowhere else — which is most of the time nowhere.
+#
+#     cargo +nightly fuzz run policy_no_more_permissive
+#     cargo +nightly fuzz run report_round_trip
+#     cargo +nightly fuzz run bpf_differential
+#
+# Every crash found here becomes a file in `corpus/<target>/` and therefore a permanent
+# regression test, because the same corpus is what the `cargo test` sweep reads.
+# Its own workspace, which is what the comment above means by "separate": without this
+# cargo reads the module's workspace above and refuses, because a package inside a
+# workspace directory must either be a member or say it is not one.
+[workspace]
+
+[package]
+name = "buildclamp-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+buildclamp-core = { path = "../crates/core" }
+buildclamp-sandbox = { path = "../crates/sandbox" }
+arbitrary = { version = "1", features = ["derive"] }
+
+[[bin]]
+name = "policy_no_more_permissive"
+path = "fuzz_targets/policy_no_more_permissive.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "report_round_trip"
+path = "fuzz_targets/report_round_trip.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "bpf_differential"
+path = "fuzz_targets/bpf_differential.rs"
+test = false
+doc = false
+bench = false

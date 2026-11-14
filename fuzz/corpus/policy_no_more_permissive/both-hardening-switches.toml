@@ -1,0 +1,10 @@
+version = 1
+
+[defaults]
+withhold-secret-reads = true
+env-allowlist = true
+
+[grants."evil"]
+capabilities = ["fs-read", "env-secret"]
+env-allow = ["OPENSSL_DIR"]
+why = "x"

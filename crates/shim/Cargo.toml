@@ -1,0 +1,23 @@
+# The three process roles cargo puts us in — the RUSTC_WRAPPER, the launcher a swapped
+# build script execs, and the unit runner that ties core and sandbox together. This is
+# the crate that knows cargo's file layout: where rustc writes a compiled build script,
+# what cargo hard-links it to, and that OUT_DIR's hash is not the compile directory's.
+[package]
+name = "buildclamp-shim"
+description = "buildclamp cargo interception: the rustc wrapper, the build-script launcher, and the unit runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+buildclamp-core = { workspace = true }
+buildclamp-sandbox = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# Scratch directories for the swap and run-directory tests.
+tempfile = { workspace = true }

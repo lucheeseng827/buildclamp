@@ -1,0 +1,58 @@
+# A version 1 buildclamp.toml, pinned as a compatibility corpus.
+#
+# Hand-written rather than generated, deliberately: `init` only ever emits the subset of
+# keys an observation implies, and the keys most likely to be broken by a change are the
+# ones a person types — `env-allow-secrets`, `write-paths`, an explicit `version`
+# requirement, a grant that has actually been reviewed. A corpus that only covered
+# generated output would certify the format against the half of it nobody writes by hand.
+#
+# It carries NO `min_tool_version`, because no buildclamp that wrote a v1 file had one.
+# That absence is the thing being tested: a policy from before the floor existed must
+# parse on a build that has it.
+#
+# When this file stops parsing, the policy format has broken every `buildclamp.toml` in
+# the field, and the fix is a version bump plus a new corpus entry — not an edit here.
+
+version = 1
+
+[defaults]
+mode = "enforce"
+trust-workspace = false
+
+[grants."openssl-sys"]
+version = ">=0.9, <0.10"
+capabilities = ["fs-write", "exec", "unix", "env-secret"]
+write-zones = ["out-dir", "tmp"]
+env-allow = ["OPENSSL_DIR", "OPENSSL_LIB_DIR"]
+why = "vendored build compiles C and reads the prefix the packager set"
+reviewed = true
+
+[grants."ring"]
+capabilities = ["fs-write", "exec", "unix"]
+write-zones = ["out-dir", "tmp"]
+write-paths = ["/opt/toolchain/scratch"]
+why = "assembles .S files with a vendored toolchain that stages outside OUT_DIR"
+reviewed = true
+
+[[grants."vendored-thing"]]
+version = ">=1.0, <2.0"
+capabilities = ["fs-write", "exec", "unix", "net"]
+write-zones = ["out-dir", "tmp"]
+net-destinations = ["mirror.example.invalid:443"]
+why = "1.x fetches its tarball at build time; pinned to the mirror we run"
+reviewed = true
+
+[[grants."vendored-thing"]]
+version = ">=2.0, <3.0"
+capabilities = ["fs-write", "exec", "unix"]
+write-zones = ["out-dir", "tmp"]
+why = "2.x vendors the tarball, so the fetch is gone"
+reviewed = false
+
+[grants."secret-reader"]
+capabilities = ["fs-write", "exec", "unix", "env-secret"]
+write-zones = ["out-dir", "tmp"]
+env-allow = ["AWS_SECRET_ACCESS_KEY"]
+env-allow-secrets = true
+why = "signs artefacts in CI; the loud opt-in is deliberate and reviewed quarterly"
+reviewed = true

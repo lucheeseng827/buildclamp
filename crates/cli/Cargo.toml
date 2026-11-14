@@ -1,0 +1,37 @@
+# The `cargo-buildclamp` binary. Wiring and human output only.
+#
+# The binary is named `cargo-buildclamp` so that `cargo buildclamp build` works: cargo
+# resolves a subcommand by looking for `cargo-<name>` on PATH. It is also the binary
+# cargo re-enters as RUSTC_WRAPPER and that a swapped build script execs, so all three
+# roles are one executable — which is what makes the shim a three-line shell script
+# pointing at an absolute path, and what makes a moved binary degrade to transparent.
+[package]
+name = "cargo-buildclamp"
+description = "buildclamp — run every build.rs and proc-macro inside a declared capability envelope"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+buildclamp-core = { workspace = true }
+buildclamp-sandbox = { workspace = true }
+buildclamp-shim = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+cargo_metadata = { workspace = true }
+# For the one error enum the CLI owns: loading a policy stack, where a cycle and an
+# unreadable file are different things a reader acts on differently.
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+# The end-to-end tests read the report the tool wrote, as any consumer would.
+serde_json = { workspace = true }
+# The signed-policy tests need to SIGN a layer to check that the binary verifies it. Signing
+# is a test-only capability here — the shipped binary verifies and never signs — so ring is a
+# dev-dependency of this crate, not a dependency.
+ring = { workspace = true }

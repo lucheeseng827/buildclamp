@@ -1,0 +1,7 @@
+[package]
+name = "benign"
+version = "0.1.0"
+edition = "2021"
+publish = false
+build = "build.rs"
+description = "Test fixture: a build script shaped like cc/bindgen. Must never produce a violation."

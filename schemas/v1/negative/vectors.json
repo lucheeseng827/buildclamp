@@ -1,0 +1,101 @@
+{
+  "comment": [
+    "Negative verification vectors for buildclamp attestations. Every entry names the",
+    "reason the document must be rejected FOR, because a verifier that rejects",
+    "everything passes a naive negative suite.",
+    "`expect` is either a VerifyError variant name, `not-fully-enforced` for a document",
+    "that verifies and must not be reported as a fully enforced run, or `accept` for the",
+    "positive control.",
+    "These are unsigned: the free binary checks everything except the signature and says",
+    "so. Cryptographic vectors belong wherever the signature is checked.",
+    "`given` names the digests a verifier should be handed for that vector. A statement's policy and report hashes appear once each, so nothing internal contradicts them and the rejection needs the file they should have matched."
+  ],
+  "vectors": [
+    {
+      "file": "VALID-control.json",
+      "expect": "accept",
+      "why": "The control. A negative suite that only contains rejections cannot tell a correct verifier from one that rejects everything, which is the failure this whole file is arranged around."
+    },
+    {
+      "file": "wrong-predicate-type.json",
+      "expect": "WrongPredicateType",
+      "why": "CVE-2022-35929: cosign returned success when no attestation of the requested type existed, because the type came from a --type flag rather than from the document. A verifier must read predicateType out of the statement. Fixed cosign is >= 1.10.1."
+    },
+    {
+      "file": "wrong-statement-type.json",
+      "expect": "WrongStatementType",
+      "why": "An older in-toto Statement has a different shape \u2014 predicate fields moved \u2014 so reading it as v1 would produce a document whose fields came from defaults."
+    },
+    {
+      "file": "wrong-subject-digest.json",
+      "expect": "InconsistentDigest",
+      "why": "The artefact hash appears twice: in `subject[0].digest`, which is what Kyverno, policy-controller and `cosign verify-attestation` match on, and in the predicate, which is what a person reads. This vector makes them differ. A verifier that checked only one would hand two readers different conclusions about the same signature, so the disagreement is itself the rejection \u2014 no --artefact needed."
+    },
+    {
+      "file": "no-subject.json",
+      "expect": "NoSubject",
+      "why": "An in-toto Statement with no subject names no artefact: there is nothing for a policy engine to match on and nothing the document could be about."
+    },
+    {
+      "file": "wrong-policy-digest.json",
+      "expect": "WrongPolicy",
+      "why": "Two builds under 'the same policy' that hash differently were not under the same policy.",
+      "given": {
+        "policy_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      }
+    },
+    {
+      "file": "wrong-report-digest.json",
+      "expect": "WrongReport",
+      "why": "The statement's whole content is a claim about what a report says. A statement pointing at a different report is a claim about a different run.",
+      "given": {
+        "report_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      }
+    },
+    {
+      "file": "read-deny-off.json",
+      "expect": "not-fully-enforced",
+      "why": "Parses and verifies; is_fully_enforced() must be FALSE. Every tier says 'enforced:' and every one of them is true about the capabilities that WERE held \u2014 while a build script could read every credential file on the host. This is the laundering case."
+    },
+    {
+      "file": "compile-units-unheld.json",
+      "expect": "not-fully-enforced",
+      "why": "Same shape: proc-macro expansion ran unheld, which is the half of the threat a build-script-only tool misses entirely, and every tier still says 'enforced:'."
+    },
+    {
+      "file": "one-advisory-capability.json",
+      "expect": "not-fully-enforced",
+      "why": "One advisory capability among enforced ones. The summary carries the WEAKEST tier seen across the whole run, so one unit out of two hundred decides this."
+    },
+    {
+      "file": "operator-override.json",
+      "expect": "not-fully-enforced",
+      "why": "An operator switched a mechanism off. The tiers cannot describe a mechanism that did not run \u2014 a switched-off one leaves either nothing or a weaker one still reporting 'enforced:' \u2014 so the override vetoes the claim before the tiers are read."
+    },
+    {
+      "file": "no-tiers-at-all.json",
+      "expect": "not-fully-enforced",
+      "why": "A run that recorded no tiers is not a run that enforced everything. `all()` over an empty collection is true, which is the shape of bug this vector exists for."
+    },
+    {
+      "file": "dsse-bad-base64.json",
+      "expect": "BadPayload",
+      "why": "A strict decoder is the point: two strings a lenient decoder reads as the same payload are two payloads one signature could be replayed across."
+    },
+    {
+      "file": "dsse-wrong-payload-type.json",
+      "expect": "WrongPayloadType",
+      "why": "The payloadType is part of what DSSE signs, through the PAE encoding. An envelope declaring one type and carrying another is a document two readers disagree about."
+    },
+    {
+      "file": "missing-enforcement-profile.json",
+      "expect": "BadJson",
+      "why": "A statement from before enforcement_profile existed cannot be read as one that has it, and must not be defaulted into 'both hardenings on' \u2014 which is the direction a serde default would have taken it."
+    },
+    {
+      "file": "missing-scope.json",
+      "expect": "BadJson",
+      "why": "Scope is mandatory. A statement that does not say what it did not hold is one whose silence a reader would take for 'nothing'."
+    }
+  ]
+}

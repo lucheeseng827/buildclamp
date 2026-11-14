@@ -1,0 +1,119 @@
+name: buildclamp
+description: >-
+  Run a cargo build with every build script held to a declared capability envelope, and
+  fail the job if this runner could not actually enforce it.
+author: buildclamp
+
+branding:
+  icon: lock
+  color: purple
+
+# Free and unlimited on public repositories, permanently. There is no key to obtain, no
+# account to create and no quota to reach. That is a commitment in the file people read
+# rather than in a page elsewhere that can be edited later.
+
+inputs:
+  command:
+    description: >-
+      The cargo verb to hold: build, check, test, clippy, doc, bench. Use `observe` on the
+      first run in a repository — it refuses nothing and records what your build does.
+    required: false
+    default: check
+  args:
+    description: "Arguments passed to cargo, after a `--`. For example: --all-features"
+    required: false
+    default: ""
+  policy:
+    description: Path to buildclamp.toml. Defaults to the one beside the workspace manifest.
+    required: false
+    default: ""
+  require-tier:
+    description: >-
+      The enforcement floor this lane needs, checked BEFORE the build — `enforced` for
+      every capability, or a list like `net=enforced,fs-write=enforced`. A runner that
+      cannot reach it fails here as a misconfigured lane rather than passing a build that
+      enforced less than you think.
+
+      Empty skips the check, which is the right setting only while you are finding out what
+      your runners can do. See the note in the README: a runner image change that removes
+      user namespaces leaves every other gate green.
+    required: false
+    default: ""
+  require-enforced:
+    description: >-
+      Fail the build if any capability could only be constrained advisorily, or not at all.
+    required: false
+    default: "true"
+  strict:
+    description: Fail if any grant in the policy is still `reviewed = false`.
+    required: false
+    default: "false"
+  summary:
+    description: Write a markdown summary of the run to the job summary.
+    required: false
+    default: "true"
+
+outputs:
+  report:
+    description: Path to the JSON report the run produced.
+    value: ${{ steps.run.outputs.report }}
+
+runs:
+  using: composite
+  steps:
+    # Said before anything else and on every run, because it is the fact the rest of the
+    # job depends on and the one nobody thinks to ask for. A green build on a runner that
+    # enforced nothing is the failure this whole tool exists to prevent, and the log is
+    # where somebody finds out.
+    - name: what this runner can enforce
+      shell: bash
+      run: cargo buildclamp doctor
+
+    - name: this lane declares the enforcement floor it needs
+      if: inputs.require-tier != ''
+      shell: bash
+      run: cargo buildclamp doctor --require '${{ inputs.require-tier }}'
+
+    - name: hold the build
+      id: run
+      shell: bash
+      env:
+        # Correlates the report with the job that produced it. Opaque to buildclamp, which
+        # records it verbatim and never parses it.
+        BUILDCLAMP_CI_CORRELATION: ${{ github.run_id }}-${{ github.run_attempt }}
+        BUILDCLAMP_AGENT_ID: ${{ runner.name }}
+      run: |
+        set -uo pipefail
+        flags=()
+        if [ -n '${{ inputs.policy }}' ]; then flags+=(--policy '${{ inputs.policy }}'); fi
+        if [ '${{ inputs.require-enforced }}' = 'true' ]; then flags+=(--require-enforced); fi
+        if [ '${{ inputs.strict }}' = 'true' ]; then flags+=(--strict); fi
+
+        # The exit code is captured rather than allowed to end the step, so the summary
+        # below is written for a FAILING run too. A reviewer looking at a red job is the
+        # one who most needs the per-unit detail, and a step that died before writing it
+        # would leave them an exit code and nothing else.
+        cargo buildclamp '${{ inputs.command }}' "${flags[@]}" -- ${{ inputs.args }}
+        code=$?
+        echo "code=$code" >> "$GITHUB_OUTPUT"
+
+        # Copied to a fixed path rather than reported from wherever the layout put it.
+        # `report --json` prints the document, so this needs no parsing of human output —
+        # and a workflow that wants to keep the record can upload one known filename.
+        if cargo buildclamp report --json > buildclamp-report.json 2>/dev/null; then
+          echo "report=buildclamp-report.json" >> "$GITHUB_OUTPUT"
+        else
+          rm -f buildclamp-report.json
+          echo "report=" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: summarise
+      if: inputs.summary == 'true'
+      shell: bash
+      run: cargo buildclamp report --markdown >> "$GITHUB_STEP_SUMMARY" || true
+
+    # Last, so the summary exists whichever way the build went. The job's verdict is the
+    # build's, not the summary step's.
+    - name: the build's verdict
+      shell: bash
+      run: exit ${{ steps.run.outputs.code }}
