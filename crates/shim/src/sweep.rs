@@ -132,11 +132,7 @@ fn sweep_one_build_dir(
         Err(e) => return Err(e),
     };
 
-    for unit_dir in entries.flatten() {
-        if !unit_dir.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-            continue;
-        }
-        let dir = unit_dir.path();
+    for dir in unit_dirs(entries) {
         let Some(hashed) = find_compiled_build_script(&dir) else {
             continue;
         };
@@ -158,6 +154,31 @@ fn sweep_one_build_dir(
         }
     }
     Ok(())
+}
+
+/// The directories under a `build/` directory that may hold a compiled build script.
+///
+/// Before cargo 1.100 that is `build/<pkg>-<hash>/`, beside the `build-script-build` link.
+/// From 1.100 it is `build/<pkg>/<hash>/out/`, and cargo executes the file there itself,
+/// so there is no link: `relink` finds none and does nothing.
+fn unit_dirs(entries: fs::ReadDir) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for e in entries.flatten() {
+        if !e.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let dir = e.path();
+        if let Ok(hashes) = fs::read_dir(&dir) {
+            for h in hashes.flatten() {
+                let o = h.path().join("out");
+                if o.is_dir() {
+                    out.push(o);
+                }
+            }
+        }
+        out.push(dir);
+    }
+    out
 }
 
 /// The `build_script_*-<hash>` file in a unit directory, if there is a real one.
@@ -221,11 +242,7 @@ pub fn unsweep(build_root: &Path) -> io::Result<usize> {
         let Ok(entries) = fs::read_dir(&build_dir) else {
             continue;
         };
-        for unit_dir in entries.flatten() {
-            let dir = unit_dir.path();
-            if !dir.is_dir() {
-                continue;
-            }
+        for dir in unit_dirs(entries) {
             let Some(hashed) = find_compiled_build_script(&dir) else {
                 continue;
             };
@@ -329,6 +346,24 @@ mod tests {
         }
         let r = sweep(d.path(), launcher()).unwrap();
         assert_eq!(r.shimmed.len(), 2, "both layouts must be swept: {r:?}");
+    }
+
+    #[test]
+    fn cargo_1_100s_layout_is_swept_and_unswept() {
+        // Measured on cargo 1.100.0: `build/<pkg>/<hash>/out/build_script_build`, no hash
+        // in the name and no `build-script-build` link; cargo executes this file.
+        let d = tempfile::tempdir().unwrap();
+        let out = d.path().join("debug/build/bs/333cbacb469d7be5/out");
+        fs::create_dir_all(&out).unwrap();
+        let bin = out.join("build_script_build");
+        fs::write(&bin, b"\x7fELF pretend build script").unwrap();
+        fs::write(out.join("build_script_build.d"), b"deps: build.rs\n").unwrap();
+        let r = sweep(d.path(), launcher()).unwrap();
+        assert_eq!(r.shimmed, vec![bin.clone()], "{r:?}");
+        assert!(swap::is_shim(&bin));
+        assert!(!out.join(EXECUTED_NAME).exists(), "no link in this layout");
+        assert_eq!(unsweep(d.path()).unwrap(), 1);
+        assert_eq!(fs::read(&bin).unwrap(), b"\x7fELF pretend build script");
     }
 
     #[test]

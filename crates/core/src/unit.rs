@@ -75,6 +75,9 @@ pub struct RustcInvocation {
     /// `<out-dir>/<crate-name>-<extra-filename>`, and that is the path the swap has to
     /// find. Cargo passes this as either `-C extra-filename=-abc` (two argv entries) or
     /// `-Cextra-filename=-abc` (one), and both are seen in practice.
+    ///
+    /// Cargo 1.100 passes none for a build-script compile: each unit has its own
+    /// directory (`build/<pkg>/<hash>/out/`), so rustc writes `<out-dir>/<crate-name>`.
     pub extra_filename: Option<String>,
 }
 
@@ -103,9 +106,14 @@ impl RustcInvocation {
             return None;
         }
         let out = self.out_dir.as_ref()?;
-        let extra = self.extra_filename.as_ref()?;
         let name = self.crate_name.as_ref()?;
-        Some(format!("{out}/{name}-{extra}"))
+        // No suffix is not a missing piece: rustc then writes `<out-dir>/<crate-name>`,
+        // which is cargo 1.100's layout. Treating it as one passed every build script
+        // through unheld, with nothing in the report to say so.
+        match &self.extra_filename {
+            Some(extra) => Some(format!("{out}/{name}-{extra}")),
+            None => Some(format!("{out}/{name}")),
+        }
     }
 }
 
@@ -133,6 +141,22 @@ impl RustcInvocation {
         let extra = self.extra_filename.as_ref()?;
         let name = self.crate_name.as_ref()?;
         Some(format!("{out}/lib{name}-{extra}.so"))
+    }
+
+    /// The profile directory (`<target>/debug`) a compile writes under, from its
+    /// `--out-dir`: what a held compile is granted, because rustc also writes
+    /// `incremental/` there, beside the out-dir rather than under it.
+    ///
+    /// Before cargo 1.100 the out-dir is `<profile>/deps`; from 1.100 it is
+    /// `<profile>/build/<pkg>/<hash>/out`, where the parent is only the unit's own
+    /// directory and granting it made every held compile fail on its incremental dir.
+    pub fn profile_dir(&self) -> Option<std::path::PathBuf> {
+        let out = std::path::Path::new(self.out_dir.as_ref()?);
+        let unit_layout = out.ends_with("out")
+            && out.ancestors().nth(3).and_then(|b| b.file_name()) == Some("build".as_ref());
+        out.ancestors()
+            .nth(if unit_layout { 4 } else { 1 })
+            .map(std::path::Path::to_path_buf)
     }
 }
 
@@ -449,6 +473,41 @@ mod tests {
         ));
         assert_eq!(got.kind, UnitKind::BuildScriptCompile);
         assert_eq!(got.build_script_output(), None);
+    }
+
+    #[test]
+    fn a_build_script_compile_without_an_extra_filename_yields_the_unsuffixed_path() {
+        // Captured from `cargo build -vv` on cargo 1.100.0: the build-script compile has
+        // its own unit directory and no `-C extra-filename`, and cargo then executes
+        // `<out-dir>/build_script_build` itself. Returning None here passed every build
+        // script through unheld.
+        let got = classify(&argv(
+            "--crate-name build_script_build --crate-type bin \
+             --out-dir /t/debug/build/bs/333cbacb469d7be5/out -C metadata=cde48755667e3bf7",
+        ));
+        assert_eq!(
+            got.build_script_output(),
+            Some("/t/debug/build/bs/333cbacb469d7be5/out/build_script_build".to_string())
+        );
+    }
+
+    #[test]
+    fn the_profile_directory_is_found_in_both_cargo_layouts() {
+        for (out_dir, want) in [
+            ("/t/debug/deps", "/t/debug"),
+            ("/t/debug/build/serde/d050780cac9eb4b3/out", "/t/debug"),
+            (
+                "/t/x86_64-unknown-linux-musl/release/deps",
+                "/t/x86_64-unknown-linux-musl/release",
+            ),
+        ] {
+            let got = classify(&argv(&format!("--crate-name serde --out-dir {out_dir}")));
+            assert_eq!(
+                got.profile_dir(),
+                Some(std::path::PathBuf::from(want)),
+                "{out_dir}"
+            );
+        }
     }
 
     #[test]

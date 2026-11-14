@@ -1,0 +1,41 @@
+# cargo-deny for buildclamp: the supply-chain job in .github/workflows/ci.yml runs
+# `cargo deny check advisories bans licenses sources` against this file. A tool about
+# build-time supply chain that did not check its own would be difficult to defend.
+
+[graph]
+all-features = true
+
+[advisories]
+yanked = "deny"
+ignore = []
+
+[licenses]
+# Every licence in the dependency graph, and nothing broader.
+allow = [
+    "Apache-2.0",
+    "MIT",
+    "ISC",
+    "Unicode-3.0",
+]
+exceptions = []
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# buildclamp phones nothing home (ADR-0005, ops/no-network-closure.sh): no HTTP client may
+# enter the graph, directly or through a wrapper.
+deny = [
+    { name = "reqwest" },
+    { name = "ureq" },
+    { name = "isahc" },
+    { name = "surf" },
+    { name = "curl" },
+    { name = "openssl-sys" },
+]
+skip = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-git = []

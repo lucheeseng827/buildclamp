@@ -12,6 +12,21 @@ below describe something else.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Cargo 1.100's build directory layout: build scripts were silently not held.** Cargo
+  1.100 gives each unit its own directory (`<profile>/build/<pkg>/<hash>/out/`), passes no
+  `-C extra-filename` to a build-script compile, and executes `out/build_script_build`
+  directly, with no `build-script-build` link. 0.1.0 read the missing suffix as a command
+  line it did not understand and passed the compile through, so no build script was held,
+  and the sweep looked one directory too shallow to catch them. The build succeeded and
+  the report listed no held units, with nothing saying why. The path is now
+  `<out-dir>/<crate-name>` when there is no suffix, and the sweep and unhook walk both
+  layouts. A held compile is granted the profile directory, not the out-dir's parent,
+  which in the new layout is the unit's own directory and denied rustc its
+  `incremental/` directory. Measured on cargo 1.100.0 and 1.99.1 (the full suite with user
+  namespaces, landlock ABI v8, seccomp notification).
+
 ## [0.1.0] - 2026-11-15
 
 ### Added

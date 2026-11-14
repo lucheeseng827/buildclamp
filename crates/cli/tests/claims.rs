@@ -469,7 +469,10 @@ fn no_absence_claim_in_the_documents_is_unregistered() {
         }
     }
 
-    assert!(read >= 3, "the absence-claim gate read {read} documents; it is looking in the wrong place");
+    assert!(
+        read >= 3,
+        "the absence-claim gate read {read} documents; it is looking in the wrong place"
+    );
     assert!(
         unregistered.is_empty(),
         "these absence claims appear in the documents and are not in CLAIMS.toml:\n  {}\n\n\

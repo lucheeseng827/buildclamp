@@ -14,12 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn bin() -> PathBuf {
-    let mut p = std::env::current_exe().expect("test binary has a path");
-    p.pop();
-    if p.ends_with("deps") {
-        p.pop();
-    }
-    p.join("cargo-buildclamp")
+    PathBuf::from(env!("CARGO_BIN_EXE_cargo-buildclamp"))
 }
 
 fn fixtures() -> PathBuf {

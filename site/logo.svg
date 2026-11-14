@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 44 44" width="44" height="44" role="img" aria-label="buildclamp">
+  <title>buildclamp</title>
+  <rect x="1.5" y="1.5" width="41" height="41" fill="#C6FF00" stroke="#000" stroke-width="3"/>
+  <path transform="translate(10 10)" d="M2 2h5v20H2zM7 2h7v5H7zM7 17h7v5H7zM9 9h13v6H9z"/>
+</svg>

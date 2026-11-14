@@ -240,13 +240,9 @@ fn hold_compile(
         out_dir: None,
         manifest_dir: std::env::var_os("CARGO_MANIFEST_DIR").map(Into::into),
         // rustc writes its artefacts under `--out-dir`, which is inside the target
-        // directory. Granting that directory rather than the whole target tree would deny
+        // directory. Granting that directory rather than the profile directory would deny
         // the incremental and dep-info files rustc writes beside it.
-        target_dir: invocation
-            .out_dir
-            .as_ref()
-            .map(std::path::PathBuf::from)
-            .and_then(|p| p.parent().map(std::path::Path::to_path_buf)),
+        target_dir: invocation.profile_dir(),
         run_dir: Some(std::path::PathBuf::from(&run_dir)),
     };
     let paths = buildclamp_shim::resolve_zones(&envelope, &unit_ctx);

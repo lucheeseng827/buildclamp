@@ -49,7 +49,11 @@ pub fn load() -> Option<Overlay> {
         .get("closed_tree")
         .and_then(toml::Value::as_str)
         .map(str::to_string);
-    Some(Overlay { claims, documents, closed_tree })
+    Some(Overlay {
+        claims,
+        documents,
+        closed_tree,
+    })
 }
 
 impl Overlay {
