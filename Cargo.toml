@@ -57,7 +57,7 @@ members = ["crates/core", "crates/sandbox", "crates/shim", "crates/cli"]
 exclude = ["tests/fixtures", "fuzz"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/lucheeseng827/buildclamp"
@@ -95,9 +95,9 @@ rust-version = "1.91"
 #     ruleset is built in the parent and the child issues one `landlock_restrict_self`.
 #     A dependency cannot be adapted into that shape from outside. See docs/adr/0002.
 [workspace.dependencies]
-buildclamp-core = { path = "crates/core", version = "0.1.0" }
-buildclamp-sandbox = { path = "crates/sandbox", version = "0.1.0" }
-buildclamp-shim = { path = "crates/shim", version = "0.1.0" }
+buildclamp-core = { path = "crates/core", version = "0.1.1" }
+buildclamp-sandbox = { path = "crates/sandbox", version = "0.1.1" }
+buildclamp-shim = { path = "crates/shim", version = "0.1.1" }
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

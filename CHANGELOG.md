@@ -12,6 +12,14 @@ below describe something else.
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-15
+
+### Security
+
+- **rustix 1.1.6 for RUSTSEC-2026-0486** (xattr functions mark unwritten bytes as
+  initialised when given a zero-length buffer), published after 0.1.0. rustix arrives
+  through `tempfile`; the lockfile bump changes nothing else.
+
 ### Fixed
 
 - **Cargo 1.100's build directory layout: build scripts were silently not held.** Cargo
