@@ -46,10 +46,14 @@ One static binary. One TOML file. Linux.
 ## Start here, not with enforcement
 
 First, get the binary on your path. Linux only, and `cargo buildclamp` is how cargo finds
-it once it is there:
+it once it is there. From 0.2 there are three ways: `cargo install cargo-buildclamp --locked`;
+a static binary for x86_64 or aarch64 from the
+[release page](https://github.com/lucheeseng827/buildclamp/releases), with its `.sha256` and
+a build-provenance attestation; or, in a Dockerfile,
+`COPY --from=mancube/buildclamp:0.2 /cargo-buildclamp /usr/local/cargo/bin/`.
 
 ```console
-$ cargo install --path crates/cli        # or --git, once there is a release
+$ cargo install cargo-buildclamp --locked
 $ cargo buildclamp doctor                # what this host can actually enforce
 host: linux 6.18.44-fc-v22 on x86_64
 
@@ -152,15 +156,39 @@ policy enforces — one shared policy per compilation, not per macro (see `docs/
 | network | **denied** | denied *(when `hold-compile-units` is on)* |
 | filesystem writes | `OUT_DIR` and a private temp dir | the target directory and a private temp dir |
 | environment | credential-shaped names withheld | credential-shaped names withheld |
-| running other programs | allowed, and recorded | allowed, and recorded |
+| running other programs | allowed and recorded, but **never from a directory it can write** | the same, for the target directory |
 
 Two of those deserve their reasoning in the open.
 
-**`exec` is allowed by default** because `cc`, `pkg-config`, `protoc` and `git` are the
-ordinary business of build scripts, and denying them would break most real dependency
-graphs on the first run. It also buys less than it looks like: every child inherits the
-namespaces and the seccomp filter, so a spawned `curl` is held exactly as tightly as the
-script that spawned it.
+**`exec` is allowed by default, write xor execute.** `cc`, `pkg-config`, `protoc` and `git`
+are the ordinary business of build scripts, and denying them would break most real
+dependency graphs on the first run; every child inherits the namespaces and the seccomp
+filter, so a spawned `curl` is held exactly as tightly as the script that spawned it. What
+a build script may **not** do is run a program from a directory it can write — `OUT_DIR`,
+its temp dir — which is the shape of a dropper: unpack a payload, then run it. On a host
+with Landlock the kernel refuses it (`enforced:landlock-vN`); without Landlock but with user
+namespaces the noexec writable mounts do (`enforced:mountns-noexec`); with neither, the
+refusal is advisory and the tier says so. The few crates that build a helper and run it (a cmake
+`try_run`, an autoconf feature test) name the zone in a grant, and `init` writes that for
+you from a recorded run:
+
+```toml
+[grants."some-sys"]
+capabilities = ["fs-write", "exec", "unix"]
+write-zones = ["out-dir", "tmp"]
+exec-zones = ["out-dir"]
+why = "runs the cmake try_run probes it compiles"
+```
+
+It stops a written file from being *executed or loaded*: where the host has user
+namespaces the writable directories are also mounted `noexec`, so `ld.so ./written` fails as
+well — the loader's `mmap(PROT_EXEC)` is refused, which Landlock's `EXECUTE` right alone
+does not see. Two things it does not stop, and the test suite pins both so the sentence
+cannot go stale: `sh written.sh`, because an interpreter reading a script is a read, not an
+exec; and a program copied into a **memfd** and run from there, because a memfd is on no
+path and under no mount. On a host with Landlock but no user namespaces, the loader trick
+is open too, and so it is inside `target/` for a held *compilation*: rustc loads proc-macros
+out of it by mapping them, so that directory cannot be mounted `noexec`.
 
 **A build script does not get the target directory, and a compilation does.** rustc
 legitimately writes all over `target/`; a build script that could write into
@@ -220,21 +248,73 @@ Landlock reports *absent on a kernel that has it* under a profile whose default 
   [Withholding credential reads](#withholding-credential-reads)), and three things about it
   have to be said in the same breath as the feature: it is **opt-in**, it is a
   **deny-list** and therefore weaker than an allow-list, and it needs **Landlock** — on a
-  host without it the tier says `none` and nothing is withheld.
+  host without it the tier says `none` and nothing is withheld. The stronger option,
+  `read-allowlist = true`, is also opt-in and also needs Landlock: see
+  [The read allowlist](#the-read-allowlist).
 - **Withholding secrets from a unit is not the same as hiding them.** Without a user
   namespace, a build script can read `/proc/<pid>/environ` of any process you own,
   including cargo's. The user namespace and not the PID one: unshared on its own,
   `CLONE_NEWPID` leaves that read returning the full environment. A fixture in this repository reads 7,883 bytes of its parent's
   environment and finds both planted credentials. The namespace tier closes this; the
   environment scrub alone only narrows it, and `doctor` tells you which you have.
-- **`net-destinations` in a grant is recorded, never enforced.** Enforcing a destination
-  list needs a proxy or firewall rules inside the network namespace. Shipping an advisory
-  field that reads as enforcement is the exact trap this tool exists to avoid, so it says
-  so wherever it appears.
+- **A destination list is TCP only, and needs both mechanisms.** With `net` and a
+  non-empty `net-destinations`, a build script stays in an empty network namespace and
+  buildclamp's supervisor makes each listed connection for it; everything else is refused.
+  UDP is never forwarded (name lookups use a private `/etc/hosts` holding the listed names).
+  It needs user namespaces, seccomp notification and Linux 5.9+; short of any of them the
+  list cannot be held and the unit gets no network at all (`enforced:netns` or
+  `enforced:seccomp-errno`), which the tier says. And it is a list of **addresses**,
+  as each name resolved at start, not of names: a destination behind a shared CDN address
+  admits every other site served from that address and port.
 - **Circumvention is possible.** A proc-macro can detect that it is being held and emit
   different code. buildclamp narrows what build-time code can reach; it does not make
   running untrusted code safe.
+- **Write xor execute stops executing and loading a written file, not every way to run
+  one.** `sh written.sh` and a program run from a memfd still work, and the loader trick does
+  too on a host without user namespaces and inside `target/` for a held compilation. See
+  the `exec` paragraph above for which host gets which rung.
 - **Attribution inside one compilation is best-effort.** See below.
+
+## The read allowlist
+
+Opt-in, and the stronger of the two read models. Turn it on in `buildclamp.toml`:
+
+```toml
+version = 2
+
+[defaults]
+read-allowlist = true
+```
+
+A build script may then read only:
+
+- the system: `/usr`, `/lib*`, `/bin`, `/sbin`, `/etc`, `/proc`, `/sys`, `/dev`, `/nix/store`;
+- the toolchain: the rustup home, and the cargo home's `registry`, `git` and `bin`. **Not**
+  the cargo home itself, which holds `credentials.toml`;
+- the workspace members, its own source, and the target profile directory, where the
+  `OUT_DIR`s of the crates it depends on live;
+- the directories it may write;
+- whatever its grant names in `read-paths`.
+
+Nothing else in your home directory, and nothing under `/opt`, `/var`, `/run` or `/root`.
+The credential deny-list still applies *inside* those roots, so a `read-paths` entry that
+covers part of your home directory does not hand `~/.aws` or `~/.ssh` back. It names
+home-directory paths only: a credential file inside your **workspace** — a `.env`, a
+project `.netrc` — is readable, because the workspace is on the allowlist. A crate that
+needs more names it:
+
+```toml
+[grants."my-protos"]
+capabilities = ["fs-write", "exec", "unix"]
+write-zones = ["out-dir", "tmp"]
+read-paths = ["~/src/shared-protos", "/opt/protoc"]
+why = "compiles the protos the platform team publishes"
+```
+
+The same three caveats as withholding apply. It needs **Landlock**. A refused read leaves
+no line in the report, because the kernel refuses it with no supervisor in the loop; the
+build script sees `EACCES`, and its own error names the path. And `observe` cannot tell you
+in advance what turning it on would break: observe enforces nothing.
 
 ## Withholding credential reads
 
@@ -252,24 +332,26 @@ full list is `crates/core/src/withhold.rs`, which is short enough to read and is
 be read. A crate that genuinely needs one asks for `fs-read` in its grant, with a reason,
 like any other capability.
 
-Measured on the fixture in `tests/fixtures/credreader`, which reads four credential paths
-and stages them into `OUT_DIR`:
+Measured on the fixture in `tests/fixtures/credreader`, which reads five credential paths
+and stages them into `OUT_DIR`. Four are on the list; the fifth, `~/.config/sometool/token`,
+is the token of a tool the list has never heard of:
 
-| | with it off | with it on |
-|---|---|---|
-| credential files read | 4 of 4 | **0 of 4** |
-| `~/.ssh` listable | yes | **no** |
-| bytes reaching `OUT_DIR` | 230 | **0** |
-| `fs-read` tier | `none` (nothing withheld) | `enforced:landlock-v7` |
+| | nothing restricted | `withhold-secret-reads` | `read-allowlist` |
+|---|---|---|---|
+| credential files read | 5 of 5 | **1 of 5** — the one the list does not name | **0 of 5** |
+| `~/.ssh` listable | yes | **no** | **no** |
+| bytes reaching `OUT_DIR` | 278 | 48 | **0** |
+| `fs-read` tier | `none` (nothing withheld) | `enforced:landlock-v7` | `enforced:landlock-v7` |
 
 ### Three things that must be said in the same breath
 
 **It is a deny-list, and a deny-list is weaker than an allow-list.** Every path not named
 stays readable: shell history, editor state, your repository's own `.env`, the source tree,
-and any credential a tool keeps somewhere the list does not know about. An allow-list is
-the stronger design and is not available here — a build script legitimately reads the
-sysroot, the registry, `/usr`, system headers and a long tail nobody can enumerate, so
-default-denying reads and granting back would break every real graph on the first run.
+and any credential a tool keeps somewhere the list does not know about — the table's middle
+column is that sentence measured. The allowlist is the stronger design, and it is opt-in
+rather than the default for one reason: a build script legitimately reads the sysroot, the
+registry, `/usr`, system headers and a long tail nobody can enumerate, so turning it on
+underneath every existing user would break builds for a reason they did not change.
 
 **It needs Landlock.** A mount namespace cannot express a read restriction, and seccomp
 could only do it advisorily at 10–40 µs on every file rustc opens — thousands per build,

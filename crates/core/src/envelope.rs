@@ -299,10 +299,29 @@ pub struct Envelope {
     /// because silently ignoring it would grant less than the file says and the person
     /// would never find out.
     pub write_zones: Vec<Forward<WriteZone>>,
+    /// The write zones it may also execute from. Every other writable directory is
+    /// no-exec: write xor execute.
+    ///
+    /// Additive, so `#[serde(default)]` and omitted when empty: a report written before
+    /// 0.2 reads as "no exec zones", which is what every unit then had in effect — exec was
+    /// not restricted at all, so there was nothing to re-allow.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exec_zones: Vec<Forward<WriteZone>>,
     /// Absolute paths it may additionally write to, for the vendored-toolchain cases
     /// that no zone describes. Rare on purpose: a policy full of absolute paths does
     /// not survive being moved to a CI runner.
     pub write_paths: Vec<String>,
+    /// Further roots it may read beneath under the read allowlist, as the grant wrote them.
+    ///
+    /// Additive: absent in a report written before 0.2, and omitted when empty.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_paths: Vec<String>,
+    /// This unit ran under the read allowlist: it could read only the allowed roots.
+    ///
+    /// Recorded per unit for the reason `env_allowlist` is, and omitted when false so a
+    /// report from a run that did not use it is byte-for-byte what it was.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub read_allowlist: bool,
     /// Environment names re-admitted despite matching a secret pattern.
     pub env_allow: Vec<String>,
     /// Whether this unit's grant opted in to re-admitting a HARD-DENIED name.
@@ -352,14 +371,12 @@ pub struct Envelope {
     pub env_allowlist: bool,
     /// Destinations recorded as expected for this unit, e.g. `crates.io:443`.
     ///
-    /// **Advisory.** The supervisor sees a destination only through a
-    /// `SECCOMP_USER_NOTIF_FLAG_CONTINUE` response, and the kernel re-reads the
-    /// `sockaddr` after we answer, so a determined script can change it in between.
-    /// Enforcing a destination allowlist needs a proxy or firewall rules inside the
-    /// network namespace, which v0 does not do. This field is therefore reported and
-    /// never enforced, and both the schema docs and the README say so — shipping an
-    /// advisory field that reads as enforcement is the exact trap this project exists
-    /// to avoid.
+    /// **Enforced since 0.2**, when the envelope also grants `net`: the unit stays in an
+    /// empty network namespace and the supervisor makes each listed TCP connection itself,
+    /// to the address it resolved, handing the unit the connected socket — no CONTINUE, so
+    /// nothing for the unit to change between the decision and the connection. Before 0.2
+    /// it was recorded only, because the supervisor could see a destination only through a
+    /// CONTINUE the kernel re-reads. Empty with `net` granted is the whole network.
     pub net_destinations: Vec<String>,
     /// Which rule produced this envelope.
     pub source: EnvelopeSource,
@@ -389,7 +406,10 @@ impl Envelope {
         Self {
             granted: CapabilitySet::of(&[Capability::FsWrite, Capability::Exec, Capability::Unix]),
             write_zones: vec![WriteZone::OutDir.into(), WriteZone::Tmp.into()],
+            exec_zones: Vec::new(),
             write_paths: Vec::new(),
+            read_paths: Vec::new(),
+            read_allowlist: false,
             env_allow: Vec::new(),
             env_allow_secrets: false,
             excepted_until: None,
@@ -411,7 +431,10 @@ impl Envelope {
         Self {
             granted: CapabilitySet::of(&[Capability::FsWrite, Capability::Exec, Capability::Unix]),
             write_zones: vec![WriteZone::Target.into(), WriteZone::Tmp.into()],
+            exec_zones: Vec::new(),
             write_paths: Vec::new(),
+            read_paths: Vec::new(),
+            read_allowlist: false,
             env_allow: Vec::new(),
             env_allow_secrets: false,
             excepted_until: None,
@@ -437,7 +460,10 @@ impl Envelope {
                 WriteZone::Target.into(),
                 WriteZone::ManifestDir.into(),
             ],
+            exec_zones: Vec::new(),
             write_paths: Vec::new(),
+            read_paths: Vec::new(),
+            read_allowlist: false,
             env_allow: Vec::new(),
             env_allow_secrets: false,
             excepted_until: None,
@@ -473,6 +499,11 @@ impl Envelope {
     /// holds wire-level names and a zone this build does not know must never answer yes.
     pub fn writes_to(&self, zone: WriteZone) -> bool {
         self.write_zones.iter().any(|z| z.copied() == Some(zone))
+    }
+
+    /// The exec zones this build understands.
+    pub fn known_exec_zones(&self) -> impl Iterator<Item = WriteZone> + '_ {
+        self.exec_zones.iter().filter_map(Forward::copied)
     }
 
     /// The zones this build understands, in the order the envelope lists them.

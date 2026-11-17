@@ -536,12 +536,17 @@ struct DisableNs(
 
 impl DisableNs {
     fn set() -> Self {
+        Self::set_to("ns")
+    }
+
+    /// The same, with any value `BUILDCLAMP_DISABLE` accepts, e.g. `notify`.
+    fn set_to(value: &str) -> Self {
         let guard = exclusive();
         let prev = std::env::var("BUILDCLAMP_DISABLE").ok();
         // SAFETY: `guard` is held for this value's whole lifetime and every other test
         // that reads the variable through `hold` takes the same lock, so no other thread
         // in this process is reading the environment while it is being written.
-        unsafe { std::env::set_var("BUILDCLAMP_DISABLE", "ns") };
+        unsafe { std::env::set_var("BUILDCLAMP_DISABLE", value) };
         DisableNs(prev, guard)
     }
 }
@@ -556,4 +561,520 @@ impl Drop for DisableNs {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Exec: write xor execute, and deny-all.
+// ---------------------------------------------------------------------------
+
+/// A scratch directory the unit may write, canonical so the paths in the report and the
+/// paths the plan names are the same string.
+fn writable_scratch() -> (tempfile::TempDir, std::path::PathBuf) {
+    let scratch = tempfile::tempdir().expect("a scratch directory");
+    let out = std::fs::canonicalize(scratch.path()).unwrap().join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    (scratch, out)
+}
+
+/// Copy a real program into `out` and try to run it from there.
+fn drop_and_run(out: &std::path::Path) -> Command {
+    let mut c = sh(&format!(
+        "cp /bin/true {0}/dropped && {0}/dropped",
+        out.display()
+    ));
+    c.env("PATH", "/usr/bin:/bin");
+    c
+}
+
+#[test]
+fn a_program_written_into_a_no_exec_directory_cannot_be_run() {
+    let host = probe::host();
+    require!(
+        host.landlock_abi.is_some() || host.seccomp_user_notif,
+        "neither Landlock nor seccomp notification, so exec cannot be restricted here"
+    );
+    let (_scratch, out) = writable_scratch();
+    let plan = Plan {
+        allow_unix: true,
+        writable: vec![out.clone()],
+        no_exec: vec![out.clone()],
+        ..Default::default()
+    };
+    let _lock = exclusive();
+    let held = plan.hold(drop_and_run(&out)).expect("holding the unit");
+    assert_ne!(held.exit_code, Some(0), "the dropped program ran");
+    assert!(
+        out.join("dropped").exists(),
+        "the copy itself must succeed: this is write-xor-execute, not a write refusal"
+    );
+    let exec = held
+        .tiers
+        .get(&Capability::Exec.into())
+        .map(Tier::label)
+        .unwrap_or_default();
+    eprintln!("exec tier on this host: {exec}");
+    if let Some(abi) = host.landlock_abi {
+        assert_eq!(exec, format!("enforced:landlock-v{abi}"));
+    }
+    if host.seccomp_user_notif {
+        let dropped = format!("{}/dropped", out.display());
+        assert!(
+            held.requests
+                .iter()
+                .any(|r| r.capability.copied() == Some(Capability::Exec)
+                    && r.target == dropped
+                    && matches!(r.outcome, Outcome::Ungranted { .. })),
+            "the refused exec must be in the record as ungranted: {:?}",
+            held.requests
+        );
+    }
+}
+
+#[test]
+fn landlock_alone_refuses_the_dropped_program() {
+    // The supervisor's refusal is authoritative but its allow is a CONTINUE a unit can
+    // race, so the guarantee has to hold with the supervisor out of the picture — and with
+    // the noexec mount out of it too, or this would pass on the mount alone. So the program
+    // is placed beforehand in a no-exec directory that is NOT a writable bind: it sits on
+    // the read-only root, which is mounted executable, and only Landlock can refuse it.
+    let host = probe::host();
+    require!(host.landlock_abi.is_some(), "no Landlock on this host");
+    require!(
+        host.user_namespaces,
+        "with notify off, nothing else could hold the unit"
+    );
+    let (_scratch, planted) = writable_scratch();
+    std::fs::copy("/bin/true", planted.join("dropped")).unwrap();
+    let plan = Plan {
+        allow_unix: true,
+        no_exec: vec![planted.clone()],
+        ..Default::default()
+    };
+    let _off = DisableNs::set_to("notify");
+    let held = plan
+        .hold(sh(&format!("{}/dropped", planted.display())))
+        .expect("holding the unit");
+    let exec = held
+        .tiers
+        .get(&Capability::Exec.into())
+        .map(Tier::label)
+        .unwrap_or_default();
+    assert!(exec.starts_with("enforced:landlock"), "exec tier: {exec}");
+    assert_ne!(
+        held.exit_code,
+        Some(0),
+        "Landlock let the dropped program run"
+    );
+}
+
+#[test]
+fn an_exec_zone_re_allows_running_what_the_unit_built() {
+    let host = probe::host();
+    require!(
+        host.landlock_abi.is_some() || host.seccomp_user_notif,
+        "exec is not restricted on this host, so there is nothing to re-allow"
+    );
+    let (_scratch, out) = writable_scratch();
+    let plan = Plan {
+        allow_unix: true,
+        writable: vec![out.clone()],
+        no_exec: vec![out.clone()],
+        exec_allowed: vec![out.clone()],
+        ..Default::default()
+    };
+    let _lock = exclusive();
+    let held = plan.hold(drop_and_run(&out)).expect("holding the unit");
+    assert_eq!(
+        held.exit_code,
+        Some(0),
+        "an exec zone must allow what it names"
+    );
+}
+
+#[test]
+fn deny_exec_still_starts_the_program_and_refuses_everything_it_spawns() {
+    let host = probe::host();
+    require!(
+        host.landlock_abi.is_some(),
+        "no Landlock, so deny-all is advisory here"
+    );
+    let plan = Plan {
+        allow_unix: true,
+        deny_exec: true,
+        ..Default::default()
+    };
+    let _lock = exclusive();
+    // `exit 3` proves the shell itself ran; `/bin/true` is what it must not be able to run.
+    let held = plan
+        .hold(sh("/bin/true || exit 3"))
+        .expect("the program itself, and its ELF interpreter, must be executable");
+    assert_eq!(
+        held.exit_code,
+        Some(3),
+        "the shell ran, and could not exec /bin/true"
+    );
+}
+
+/// The dynamic loader for this architecture, if it is where the usual distributions put it.
+fn loader() -> Option<&'static str> {
+    ["/lib64/ld-linux-x86-64.so.2", "/lib/ld-linux-aarch64.so.1"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+}
+
+#[test]
+fn the_loader_cannot_run_a_dropped_program_where_the_mount_namespace_applies() {
+    // `ld.so ./written` execs only the loader, which lives outside every no-exec directory,
+    // and the loader then maps the written file PROT_EXEC — which Landlock's EXECUTE right
+    // does not see. The noexec mount does: the kernel refuses PROT_EXEC on it.
+    let host = probe::host();
+    require!(
+        host.user_namespaces,
+        "no user namespaces, so no noexec mount"
+    );
+    let Some(ld) = loader() else {
+        eprintln!("SKIP: no dynamic loader at a known path");
+        return;
+    };
+    let (_scratch, out) = writable_scratch();
+    let plan = Plan {
+        allow_unix: true,
+        writable: vec![out.clone()],
+        no_exec: vec![out.clone()],
+        ..Default::default()
+    };
+    let _lock = exclusive();
+    let held = plan
+        .hold({
+            let mut c = sh(&format!(
+                "cp /bin/true {o}/dropped && {ld} {o}/dropped",
+                o = out.display()
+            ));
+            c.env("PATH", "/usr/bin:/bin");
+            c
+        })
+        .expect("holding the unit");
+    assert!(out.join("dropped").exists(), "the copy must succeed");
+    assert_ne!(
+        held.exit_code,
+        Some(0),
+        "the loader ran a program written into a no-exec directory"
+    );
+}
+
+#[test]
+fn a_held_program_inside_a_no_exec_directory_still_starts() {
+    // The supervisor always allows the held program; Landlock must too, or a unit whose
+    // program lives where it can write (a grant writing `target`) starts on one host and
+    // not another.
+    let host = probe::host();
+    require!(host.landlock_abi.is_some(), "no Landlock on this host");
+    let (_scratch, out) = writable_scratch();
+    std::fs::copy("/bin/true", out.join("prog")).unwrap();
+    let plan = Plan {
+        allow_unix: true,
+        writable: vec![out.clone()],
+        no_exec: vec![out.clone()],
+        ..Default::default()
+    };
+    // With namespaces ON: the noexec bind is what refused it before the fix.
+    let _lock = exclusive();
+    let held = plan
+        .hold(Command::new(out.join("prog")))
+        .expect("the held program itself must be allowed to start");
+    assert_eq!(held.exit_code, Some(0));
+}
+
+#[test]
+fn a_program_run_from_a_memfd_is_a_known_limit() {
+    // Stated in the README, the CHANGELOG and the claim's context, and pinned here so the
+    // statement cannot go stale in either direction: a memfd is on no path, so neither the
+    // Landlock rule nor the noexec mount covers it. If this starts failing, something now
+    // stops it — update the docs, then this test.
+    let host = probe::host();
+    require!(
+        host.landlock_abi.is_some() || host.user_namespaces,
+        "nothing restricts exec here"
+    );
+    let has_python = Command::new("/bin/sh")
+        .args(["-c", "command -v python3"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    require!(has_python, "no python3 to create a memfd with");
+    // A host whose kernel refuses executable memfds itself (`vm.memfd_noexec`, 6.3+) closes
+    // the hole without us, and that must not read as "buildclamp now stops it".
+    let memfd_noexec = std::fs::read_to_string("/proc/sys/vm/memfd_noexec")
+        .ok()
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        .unwrap_or(0);
+    require!(
+        memfd_noexec == 0,
+        "the kernel already refuses executable memfds here"
+    );
+    let (_scratch, out) = writable_scratch();
+    let plan = Plan {
+        allow_unix: true,
+        writable: vec![out.clone()],
+        no_exec: vec![out.clone()],
+        ..Default::default()
+    };
+    let _lock = exclusive();
+    let held = plan
+        .hold({
+            let mut c = sh("python3 -c \"import os;fd=os.memfd_create('x');\
+                            os.write(fd,open('/bin/true','rb').read());\
+                            os.execve(fd,['t'],{})\"");
+            c.env("PATH", "/usr/bin:/bin");
+            c
+        })
+        .expect("holding the unit");
+    assert_eq!(
+        held.exit_code,
+        Some(0),
+        "a memfd exec is now refused — update the docs"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Reads: the allowlist.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_read_allowlist_leaves_only_the_allowed_roots_readable_minus_what_is_withheld() {
+    let host = probe::host();
+    require!(
+        host.landlock_abi.is_some(),
+        "no Landlock, so reads cannot be restricted here"
+    );
+    let scratch = tempfile::tempdir().expect("a scratch directory");
+    let base = std::fs::canonicalize(scratch.path()).unwrap();
+    let allowed = base.join("allowed");
+    let other = base.join("other");
+    std::fs::create_dir_all(&allowed).unwrap();
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(allowed.join("ok.txt"), "fine\n").unwrap();
+    std::fs::write(allowed.join(".netrc"), "machine x password PLACEHOLDER\n").unwrap();
+    std::fs::write(other.join("token"), "PLACEHOLDER\n").unwrap();
+
+    // The shell, `cat` and their libraries must stay readable, as they would for a real
+    // build script under the allowlist.
+    let mut roots: Vec<std::path::PathBuf> = ["/usr", "/lib", "/lib64", "/bin", "/etc"]
+        .iter()
+        .map(std::path::PathBuf::from)
+        .collect();
+    roots.push(allowed.clone());
+    let plan = Plan {
+        allow_unix: true,
+        read_allowed: roots,
+        withheld_reads: vec![allowed.join(".netrc")],
+        ..Default::default()
+    };
+    let script = format!(
+        "cat {a}/ok.txt >/dev/null || exit 2; \
+         cat {o}/token >/dev/null 2>&1 && exit 3; \
+         cat {a}/.netrc >/dev/null 2>&1 && exit 4; \
+         exit 0",
+        a = allowed.display(),
+        o = other.display()
+    );
+    let _lock = exclusive();
+    let held = plan
+        .hold({
+            let mut c = sh(&script);
+            c.env("PATH", "/usr/bin:/bin");
+            c
+        })
+        .expect("holding the unit");
+    assert_eq!(
+        held.exit_code,
+        Some(0),
+        "2 = an allowed file was unreadable, 3 = a file outside every root was read, \
+         4 = a withheld file inside an allowed root was read"
+    );
+    let tier = held
+        .tiers
+        .get(&Capability::FsRead.into())
+        .map(Tier::label)
+        .unwrap_or_default();
+    assert!(
+        tier.starts_with("enforced:landlock"),
+        "fs-read tier: {tier}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Network destinations.
+// ---------------------------------------------------------------------------
+
+/// Linux 5.9+, for SECCOMP_IOCTL_NOTIF_ADDFD with SETFD — what destination mode needs.
+fn kernel_has_addfd(host: &buildclamp_core::HostCapabilities) -> bool {
+    let mut v = host
+        .kernel
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|p| !p.is_empty())
+        .map(|p| p.parse::<u32>().unwrap_or(0));
+    matches!((v.next(), v.next()), (Some(a), Some(b)) if (a, b) >= (5, 9))
+}
+
+#[test]
+fn a_listed_destination_is_reachable_by_name_and_nothing_else_is() {
+    let host = probe::host();
+    require!(
+        host.user_namespaces && host.seccomp_user_notif && kernel_has_addfd(&host),
+        "destinations need an empty network namespace, the supervisor and Linux 5.9+"
+    );
+    let has_python = Command::new("/bin/sh")
+        .args(["-c", "command -v python3"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    require!(has_python, "no python3 to make connections with");
+
+    // A listener in THIS namespace, which the unit's empty one cannot reach on its own.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let allowed = listener.local_addr().unwrap();
+    let other = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let denied = other.local_addr().unwrap();
+    std::thread::spawn(move || {
+        for s in listener.incoming().flatten() {
+            use std::io::Write;
+            let mut s = s;
+            let _ = s.write_all(b"HELLO\n");
+        }
+    });
+
+    let plan = Plan {
+        allow_unix: true,
+        net_allowed: vec![allowed],
+        hosts: Some("127.0.0.1 localhost\n127.0.0.1 allowed.test\n".into()),
+        ..Default::default()
+    };
+    let script = format!(
+        "python3 -c \"
+import socket, sys
+s = socket.create_connection(('allowed.test', {ap}), timeout=5)
+if s.recv(16) != b'HELLO\\n': sys.exit(2)
+import ctypes
+libc = ctypes.CDLL(None, use_errno=True)
+# The proxied socket lives in the host's namespace. Disconnecting it (AF_UNSPEC) would let
+# it be re-aimed, so that must be refused; and io_uring, which never passes the filter.
+if libc.connect(s.fileno(), (ctypes.c_char * 16)(), 16) == 0: sys.exit(5)
+if libc.syscall(425, 1, (ctypes.c_char * 120)()) >= 0: sys.exit(6)
+# glibc's ranking probe: answered without CONTINUE, so it cannot be raced into a re-aim.
+u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+if u.connect_ex(('127.0.0.1', 0)) != 101: sys.exit(7)
+try:
+    socket.create_connection(('127.0.0.1', {dp}), timeout=5)
+    sys.exit(3)
+except PermissionError:
+    sys.exit(0)
+except Exception as e:
+    print(type(e).__name__); sys.exit(4)
+\"",
+        ap = allowed.port(),
+        dp = denied.port()
+    );
+    let _lock = exclusive();
+    let held = plan
+        .hold({
+            let mut c = sh(&script);
+            c.env("PATH", "/usr/bin:/bin");
+            c
+        })
+        .expect("holding the unit");
+    assert_eq!(
+        held.exit_code,
+        Some(0),
+        "2 = the listed destination did not answer, 3 = an unlisted one was reached, \
+         4 = it failed some other way, 5 = the proxied socket could be disconnected and \
+         re-aimed, 6 = io_uring was available, 7 = a datagram probe was not refused \
+         with ENETUNREACH"
+    );
+    assert!(
+        !held.requests.iter().any(|r| r.target.ends_with(":0")),
+        "datagram probes are not recorded: {:?}",
+        held.requests
+    );
+    let net = held
+        .tiers
+        .get(&Capability::Net.into())
+        .map(Tier::label)
+        .unwrap_or_default();
+    assert_eq!(net, "enforced:netns+connect-proxy");
+    assert!(
+        held.requests
+            .iter()
+            .any(|r| r.target == allowed.to_string() && matches!(r.outcome, Outcome::Granted)),
+        "the proxied connect is in the record as granted: {:?}",
+        held.requests
+    );
+}
+
+#[test]
+fn observe_records_a_listed_destination_as_granted_and_an_unlisted_one_as_would_be_refused() {
+    // Observe refuses nothing and runs on the real network, but what it records is what
+    // `init` and drift read: a crate with a list must not have its listed connects recorded
+    // as refused, nor glibc's datagram address-ranking probes recorded at all.
+    let host = probe::host();
+    require!(
+        host.seccomp_user_notif,
+        "observe records through the supervisor"
+    );
+    let has_python = Command::new("/bin/sh")
+        .args(["-c", "command -v python3"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    require!(has_python, "no python3 to make connections with");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let allowed = listener.local_addr().unwrap();
+    let other = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let unlisted = other.local_addr().unwrap();
+    std::thread::spawn(move || for _ in listener.incoming() {});
+    std::thread::spawn(move || for _ in other.incoming() {});
+    let plan = Plan {
+        allow_unix: true,
+        observe_only: true,
+        net_allowed: vec![allowed],
+        ..Default::default()
+    };
+    let script = format!(
+        "python3 -c \"
+import socket
+socket.create_connection(('127.0.0.1', {a}), timeout=5)
+socket.create_connection(('127.0.0.1', {u}), timeout=5)
+u = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+u.connect(('127.0.0.1', 0))
+\"",
+        a = allowed.port(),
+        u = unlisted.port()
+    );
+    let _lock = exclusive();
+    let held = plan
+        .hold({
+            let mut c = sh(&script);
+            c.env("PATH", "/usr/bin:/bin");
+            c
+        })
+        .expect("holding the unit");
+    assert_eq!(held.exit_code, Some(0), "observe refuses nothing");
+    let outcome = |t: String| {
+        held.requests
+            .iter()
+            .find(|r| r.syscall == "connect" && r.target == t)
+            .map(|r| r.outcome.clone())
+    };
+    assert!(matches!(
+        outcome(allowed.to_string()),
+        Some(Outcome::Granted)
+    ));
+    assert!(matches!(
+        outcome(unlisted.to_string()),
+        Some(Outcome::WouldBeUngranted)
+    ));
+    assert!(
+        outcome("127.0.0.1:0".to_string()).is_none(),
+        "a datagram connect is not network use and is not recorded"
+    );
 }

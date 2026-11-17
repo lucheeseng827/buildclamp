@@ -122,10 +122,9 @@ assumptions = [
 evidence = [
   "test:a_withheld_credential_is_refused_at_a_named_enforced_tier",
   "test:a_build_script_reads_every_planted_credential_when_nothing_withholds_them",
-  "test:staging_a_withheld_path_into_out_dir_fails_rather_than_staging_nothing_quietly",
   "test:an_ordinary_read_still_works_while_credentials_are_withheld",
 ]
-checked = "2026-09-15"
+checked = "2026-11-15"
 
 [[claim]]
 id = "publish-is-gated-before-the-upload"
@@ -506,15 +505,101 @@ mechanism string `notify`, not on `seccomp`, for exactly that reason. `doctor` q
 `seccomp_unotify(2)` verbatim wherever a capability falls to that tier.
 """
 assumptions = [
-  "exec is observe-only: recorded through the notification supervisor and never refused, so its tier is advisory on every host and it is excluded from `--require-enforced` and from `--require` floors rather than making them unsatisfiable",
+  "exec is enforced by Landlock's EXECUTE right or the noexec writable mounts, never by the supervisor: its refusal of an exec is atomic, but its allow is a CONTINUE, so on a host with neither exec's tier is advisory and counts against `--require-enforced` (until 0.2 exec was observe-only and excluded from both)",
 ]
 evidence = [
   "test:no_enforced_tier_is_labelled_with_a_notification_mechanism",
   "test:a_seccomp_errno_refusal_is_enforcement_but_a_notification_decision_is_not",
   "test:doctor_on_a_host_with_neither_mechanism_says_what_that_means_for_the_user",
-  "test:an_observe_only_capability_cannot_be_named_in_a_floor",
+  "test:the_notify_mechanism_exists_and_is_advisory",
+  "test:exec_can_be_named_in_a_floor_since_it_can_be_enforced",
 ]
-checked = "2026-09-16"
+checked = "2026-11-15"
+
+[[claim]]
+id = "read-allowlist-refuses-unlisted-credentials"
+kind = "capability"
+text = "Under `read-allowlist`, a build script cannot read a credential in the home directory even when no deny-list names it, while an ordinary build script still builds."
+where = ["README.md", "docs/CONFIG.md", "CHANGELOG.md"]
+context = """
+Linux with Landlock. Opt-in. Without Landlock the fs-read tier is `none` with that reason.
+A refused read leaves no request in the report: Landlock refuses in the kernel with no
+supervisor in the loop.
+"""
+assumptions = [
+  "the home directory is not inside a workspace member, the target directory or a read-path",
+  "the allowed roots exist when the unit starts; a missing one is skipped, which fails closed",
+]
+evidence = [
+  "test:the_read_allowlist_refuses_every_credential_including_ones_no_list_names",
+  "test:under_the_allowlist_no_credential_byte_reaches_out_dir",
+  "test:a_read_allowlist_leaves_only_the_allowed_roots_readable_minus_what_is_withheld",
+  "test:an_ordinary_build_script_passes_under_the_read_allowlist",
+  "test:an_allowed_root_is_granted_whole_unless_something_withheld_is_inside_it",
+]
+checked = "2026-11-15"
+
+[[claim]]
+id = "net-destinations-are-enforced"
+kind = "capability"
+text = "With `net` and a non-empty `net-destinations`, a held build script reaches only the addresses and ports the listed names resolved to when it started, and every allowed TCP connect is made by the supervisor rather than continued."
+where = ["README.md", "docs/CONFIG.md", "CHANGELOG.md"]
+context = """
+Linux 5.9+ with user namespaces and seccomp notification; the tier is
+`enforced:netns+connect-proxy`. Creating an inet or netlink socket is let through with CONTINUE;
+in the empty namespace it reaches nothing. Packet, vsock and unknown families are refused. No connect is ever continued: glibc's datagram ranking
+connects (port 0, then AF_UNSPEC to reset) are refused with ENETUNREACH and not recorded,
+because a continued connect could be re-aimed through a proxied host-namespace socket dup'd
+over its descriptor. A proxied socket cannot be disconnected (AF_UNSPEC is refused) and
+io_uring is unavailable, which the test pins. TCP only. Without either mechanism the list cannot be held and
+the unit gets no network at all. Names are resolved when the unit starts, on the host.
+"""
+assumptions = [
+  "the supervisor can borrow the unit's socket through a pidfd (pidfd_getfd), which needs the same uid and, under Yama, the unit being its descendant; it always is",
+  "the hosts file is written to a fresh 0700 directory under the host's temp directory, which no held unit can write because its writes are confined to its own writable directories; a temp directory inside a unit's writable directory would void that",
+  "the private /etc/hosts answers lookups only where the host's nsswitch consults `files` first; with `resolve` or `dns` first a lookup may return other addresses, which are then refused",
+  "enforcement is per address, not per name: a shared CDN address admits every other site on it, so a destination behind one bounds the address and port, not the site",
+]
+evidence = [
+  "test:a_listed_destination_is_reachable_by_name_and_nothing_else_is",
+  "test:a_build_script_reaches_only_its_listed_destinations",
+  "test:destinations_are_reported_as_enforced_only_where_the_run_enforced_them",
+]
+checked = "2026-11-15"
+
+[[claim]]
+id = "exec-write-xor-execute"
+kind = "capability"
+text = "A held build script cannot execute or load a program from a directory it can write (OUT_DIR, its private tmp, any write-paths) unless its grant names that zone in `exec-zones`; the kernel refuses it, with the supervisor out of the loop."
+where = ["README.md", "docs/CONFIG.md", "CHANGELOG.md"]
+context = """
+Linux. `execve` is refused by Landlock's EXECUTE right (5.13+, `enforced:landlock-vN`);
+loading through `ld.so` is refused by the noexec writable binds, which need user namespaces
+and are also the whole rung (`enforced:mountns-noexec`) on a host without Landlock. With
+seccomp notification alone the rule is advisory and the tier says so. NOT covered, and
+pinned by a test: a program run from a memfd (on no path, under no mount), and
+`sh dropped.sh` (a read, not an exec). With Landlock but no user namespaces the loader
+trick is open, and inside `target/` for a held compilation, which rustc maps proc-macros from.
+A held program that itself lives in a no-exec directory (a grant writing `target`) is allowed
+to start by inode, so a unit that rewrites that file in place can run new code as "the
+program"; buildclamp's own build scripts never live in a zone they can write.
+"""
+assumptions = [
+  "the writable directories exist when the unit starts, so their canonical paths are the ones Landlock keys on",
+  "the complement grant is a snapshot: a directory created after the unit starts, outside every zone, is not executable, which fails closed",
+]
+evidence = [
+  "test:a_program_written_into_a_no_exec_directory_cannot_be_run",
+  "test:landlock_alone_refuses_the_dropped_program",
+  "test:an_exec_zone_re_allows_running_what_the_unit_built",
+  "test:deny_exec_still_starts_the_program_and_refuses_everything_it_spawns",
+  "test:the_loader_cannot_run_a_dropped_program_where_the_mount_namespace_applies",
+  "test:a_held_program_inside_a_no_exec_directory_still_starts",
+  "test:a_program_run_from_a_memfd_is_a_known_limit",
+  "test:a_build_script_cannot_run_a_program_it_wrote_into_out_dir",
+  "test:an_exec_zone_lets_a_build_script_run_what_it_built",
+]
+checked = "2026-11-15"
 
 [[claim]]
 id = "exact-proc-macro-attribution-is-demonstrated"

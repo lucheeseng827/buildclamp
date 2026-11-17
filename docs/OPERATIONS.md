@@ -95,9 +95,11 @@ target directory.
 **What is deliberately out of scope.** Four things, stated because a security tool's
 silence about a limit reads as a claim:
 
-- **Destination allowlists are reported, never enforced.** Enforcing one needs a resolving
-  proxy. A tool that appears to enforce a destination list while a build script can
-  resolve a name itself is worse than one that admits it does not.
+- **Destination lists are TCP only.** A grant's `net-destinations` is enforced since 0.2,
+  through an empty network namespace and the supervisor making each listed connection; UDP
+  is never forwarded, and a host without user namespaces or seccomp notification gives the
+  unit no network rather than an unenforced list (a host with neither does not hold the
+  unit at all; see [CONFIG](CONFIG.md)).
 - **Environment scrubbing controls exposure, not access.** There is no syscall for
   `getenv`. Only a user namespace closes the hole of a unit reading a sibling process's
   environment, and the report says whether one applied.
@@ -266,8 +268,8 @@ the syntax. [Policy authoring](POLICY.md#the-four-things-a-crate-can-need) has t
 
 **It reaches the network.** Vendored `-sys` crates that download a tarball rather than
 vendoring it, and anything with a `download` or `fetch` feature. Add `net` and write the
-destinations down — they are reported and never enforced, and the report records what was
-actually reached, so a difference between the two is a finding.
+destinations down — host names, not addresses — and since 0.2 they are enforced: a
+connection anywhere else is refused, and the refusal names the address it tried, so you can add the host name it belongs to.
 
 **It writes outside `OUT_DIR`.** Code generators configured to write into `src/`
 (`prost-build` with `out_dir` set that way is the common one), and anything that caches into

@@ -152,7 +152,7 @@ Everything after a bare `--` reaches cargo unchanged. That is how `--release`,
 |---|---|---|---|---|
 | `--policy <FILE>` | path | `buildclamp.toml` beside the workspace manifest | which policy to load | a repository holding several policies, or a policy kept outside the tree |
 | `--strict` | bool | off | exit 2 if any grant is still `reviewed = false` | in CI, once the policy has been through review. This is what stops `init`'s output becoming permanent |
-| `--require-enforced` | bool | off | exit 2 if any capability buildclamp can refuse was only advisory on this host. **Exec is excluded**: it is observe-only — recorded, never refused, on every host — so requiring it enforced would fail everywhere | in CI, when a green build on a host that could not enforce anything would be worse than a red one |
+| `--require-enforced` | bool | off | exit 2 if any capability was only advisory on this host. **Exec counts** since 0.2: write xor execute is enforced by Landlock or, without it, by the noexec writable mounts, so only on a host with neither (no Landlock, no user namespaces) is exec advisory and this fails — or, without Landlock, for a crate whose grant drops `exec`, which a mount flag cannot express | in CI, when a green build on a host that could not enforce anything would be worse than a red one |
 | `--require-signed-policy` | bool | off | refuse the build if any distributed (`extends`ed) policy layer is not signed by a key in the committed `trust-root`. The committed `buildclamp.toml` itself is trusted because it is committed, not by signature, so a repository with no distributed layers has nothing to refuse. Checked before the build, like every other policy error | in CI, once the org distributes a signed policy bundle and you want an unsigned or tampered one to fail rather than be silently accepted |
 | `--deep` | bool | off | record every write a held unit makes, not only the ones the policy refused | seeing what a build script actually wrote. On an enforcing run the kernel refuses out-of-zone writes and the permitted ones are never notified, so without this the report lists what was stopped and not what was done. Not something to leave on: each notified syscall costs 10 to 40 microseconds. It does **not** reach inside a compile unit — those are not held |
 | `--grace <DAYS>` | integer | off | warn rather than fail on a grant `init` first wrote within the last N days | the first weeks of a policy, and after a dependency bump. Only affects `--strict`, and only for grants carrying `first-seen`; a grant with no date is never in grace, so `--grace 3650` on a year-old policy excuses nothing |
@@ -230,7 +230,7 @@ older one, `schemas/v1/negative/wrong-predicate-type.json` is the vector that ma
 | flag | applies to | default | what it does |
 |---|---|---|---|
 | `--json` | `doctor` | off | emit `HostCapabilities` instead of the table — the same object that appears under `host` in `report.json`, so a consumer needs no second schema |
-| `--require <TIER_SET>` | `doctor` | none | the enforcement floor this lane requires. `--require net=enforced,fs-write=enforced`, or a bare `--require enforced` for every capability buildclamp can refuse. `exec` is observe-only and refused in a floor by name. Exit 2 when the host falls short, exit 1 when the floor itself cannot be parsed |
+| `--require <TIER_SET>` | `doctor` | none | the enforcement floor this lane requires. `--require net=enforced,fs-write=enforced`, or a bare `--require enforced` for every capability, `exec` included since 0.2. Exit 2 when the host falls short, exit 1 when the floor itself cannot be parsed |
 | `--no-network` | `selftest` | off | run a command inside a build script's envelope with the network denied, and fail if anything in it asked for the network |
 | `<COMMAND>` | `selftest` | this binary | the command to run, after a bare `--` |
 
@@ -379,6 +379,7 @@ the behaviour, and a candidate for 0.4.0 has it.
 | `trust-workspace` | bool | `false` | run the workspace's own build scripts unheld |
 | `withhold-secret-reads` | bool | `false` | make the credential paths in `crates/core/src/withhold.rs` unreadable to build units. Needs Landlock; a crate that needs one asks for `fs-read` in its grant |
 | `env-allowlist` | bool | `false` | give units only the base set in `ENV_ALLOWLIST_BASE` plus what a grant names, instead of everything minus `env-deny` |
+| `read-allowlist` | bool | `false` | let units read only the system, the toolchain (rustup home; cargo home's `registry`, `git`, `bin`), the workspace members, their own source, the target profile directory and a grant's `read-paths` — instead of everything minus the credential deny-list, which still applies inside those roots. Needs Landlock. A crate that needs to read everything asks for `fs-read` |
 | `hold-compile-units` | bool | `false` | hold the rustc invocations where proc-macros expand, not only build scripts. One shared policy per compilation, not per macro |
 | `env-deny` | list of patterns | the built-in list | **replaces** the built-in list entirely when present |
 | `max-active-exceptions` | integer | `3` | how many `[[exception]]` blocks may be live at once before the policy is refused. `0` forbids break-glass in this repository entirely |
@@ -410,10 +411,12 @@ commit access to hide. Holding it costs nothing when it is honest.
 | `version` | semver req | any version | which versions the grant applies to |
 | `capabilities` | list | none | `net`, `unix`, `fs-write`, `fs-read`, `env-secret`, `exec` |
 | `write-zones` | list | none | `out-dir`, `tmp`, `target`, `manifest-dir` |
+| `exec-zones` | list | none | write zones this crate may also **run programs from**. Every writable directory is no-exec by default (write xor execute); each entry must also be in `write-zones`, and the grant must include `exec`. `init` writes it when a recorded run executed something from a zone. The private tmp lives inside `OUT_DIR`, so `exec-zones = ["out-dir"]` also allows running from `tmp`; `["tmp"]` alone does not allow `out-dir` |
 | `write-paths` | list of paths | none | additional writable paths |
+| `read-paths` | list of paths | none | further roots this crate may read beneath under `read-allowlist`. Absolute or `~/`-relative, no `..` |
 | `env-allow` | list of names | none | environment names re-admitted to this unit |
 | `env-allow-secrets` | bool | `false` | permits `env-allow` to re-admit a hard-denied name |
-| `net-destinations` | list of `host:port` | none | **reported, never enforced** |
+| `net-destinations` | list of `host:port` | none | enforced since 0.2: with `net` and a non-empty list, a build script reaches only the addresses and ports these resolve to when it starts, over TCP; an empty list is the whole network. A shared CDN address admits other sites on it. Write host names rather than addresses, so a CDN moving does not break the build |
 | `reviewed` | bool | `false` | whether a human has read this grant. `init` writes `false` |
 | `first-seen` | date | none | the day `init` first wrote this grant, `YYYY-MM-DD`. What `--grace` measures from. Absent is **not** a synonym for new: a grant with no date gets no grace at all |
 
@@ -433,10 +436,22 @@ Four rules the parser enforces, each of which is a refusal rather than a guess:
 4. **Unknown keys are errors.** `deny_unknown_fields` on every type, so a typo in
    `capabilties` fails the parse instead of quietly granting nothing.
 
-`net-destinations` is reported and never enforced, and the code says so in the same
-sentence as the field. Enforcing a destination allowlist would need a resolving proxy, and
-a tool that appears to enforce one while a build script can resolve a name itself is worse
-than one that admits it does not.
+`net-destinations` is enforced since 0.2. With `net` and a non-empty list, the unit stays in
+an empty network namespace; each listed `host:port` is resolved when the unit starts and
+written into a private `/etc/hosts`; and when the unit connects to one of those addresses,
+buildclamp's supervisor makes the TCP connection itself and hands the unit the connected
+socket. Anything else is refused. The tier is `enforced:netns+connect-proxy`. TCP only, and it
+needs user namespaces, seccomp notification and Linux 5.9+. Short of any of them the list cannot be held and the unit gets no network at all: `enforced:netns` with user namespaces, `enforced:seccomp-errno` without (inet sockets refused). A host with neither mechanism does not run a held unit at all. The same happens when none of the listed names resolves at start; the build
+log says which did not. `net` with an empty list is still the whole network.
+
+Enforcement is by address and port, as each name resolved when the unit started — not by name. A destination behind a shared CDN address (Cloudflare, Fastly, CloudFront) admits every other site served from that address on that port; holding a name would need a proxy that checks the TLS server name. The replacement socket keeps the unit's non-blocking, close-on-exec,
+`TCP_NODELAY` and `SO_KEEPALIVE` settings; anything else set before `connect` — a local
+`bind`, buffer sizes — is not carried over. Each connect is made with a 10 s timeout on the
+supervisor's thread, so a slow destination stalls that unit's other syscalls while it waits.
+A destination must carry a port; one without is a policy error. The private `/etc/hosts`
+answers lookups where the host's `/etc/nsswitch.conf` consults `files` before `resolve` or
+`dns`, as Debian and Ubuntu ship it; where it does not, a lookup may return addresses other
+than the ones resolved at start, and connects to those are refused.
 
 ### `[layer]`
 

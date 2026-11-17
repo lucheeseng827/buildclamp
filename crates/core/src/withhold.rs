@@ -9,12 +9,14 @@
 //! be worth denying by default — not everything that matters, and not everything an
 //! attacker would want.
 //!
-//! An allow-list is the stronger design and is not available here. A build script legibly
-//! needs to read the sysroot, the cargo registry, `/usr`, `/etc/ssl`, its own manifest
-//! directory, `OUT_DIR`, and a long tail nobody can enumerate in advance — `cc` reads
-//! compiler internals, `bindgen` reads system headers, `pkg-config` reads `.pc` files
-//! wherever the distribution put them. Default-denying reads and granting back would break
-//! every real graph on the first run, which is the failure mode `docs/adr/0001` is about.
+//! An allow-list is the stronger design, and since 0.2 it exists as `read-allowlist`, opt-in.
+//! It is not the default because a build script legibly needs to read the sysroot, the
+//! cargo registry, `/usr`, `/etc/ssl`, its own manifest directory, `OUT_DIR`, and a long
+//! tail nobody can enumerate in advance — `cc` reads compiler internals, `bindgen` reads
+//! system headers, `pkg-config` reads `.pc` files wherever the distribution put them.
+//! Default-denying reads underneath existing users would break real graphs on the first
+//! run, which is the failure mode `docs/adr/0001` is about. This list still applies inside
+//! the allowlist's roots.
 //!
 //! So: a named set, denied by default when the policy asks for it, with the residue
 //! stated. The README carries the same sentence, because a reader who takes this for an

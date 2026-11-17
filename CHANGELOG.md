@@ -12,6 +12,166 @@ below describe something else.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-11-17
+
+### Upgrade notes
+
+1. **Does an existing `buildclamp.toml` still parse and mean the same thing?** It parses,
+   with one exception: a `net-destinations` entry without a port is now a policy error
+   (write `"crates.io:443"`). It does not all mean the same thing. `net-destinations` is now
+   enforced rather than recorded, a grant that omits `exec` now refuses every exec, and a
+   program a build script wrote is refused unless the grant names its zone in `exec-zones`.
+   See Changed below for what to write in each case. `POLICY_VERSION` stays 2: the new keys
+   (`exec-zones`, `read-allowlist`, `read-paths`) are additive, and a 0.1 release given a
+   policy that uses them refuses it by key name instead of enforcing less than it says.
+2. **Does an existing report still read?** Yes. `REPORT_FORMAT_VERSION` stays 2. A 0.1
+   report reads in 0.2 with its exec tier exempt as before, and 0.1.1's `report` reads a
+   report written by 0.2.0 (checked 2026-11-17).
+3. **Can a build that passed now fail?** Yes: a build script that runs a program it
+   compiled into a directory it can write. Measured 2026-11-17 on Linux 6.18 with Landlock
+   ABI v7, cargo 1.100, a fresh lock of 17 build-script crates (30 build-script units):
+   `libc` 0.2.191, `proc-macro2` 1.0.107, `serde` 1.0.229, `serde_json` 1.0.154, `anyhow`
+   1.0.104, `rustix` 1.1.6, `ring` 0.17.14, `libz-sys` 1.1.33 (static), `libsqlite3-sys`
+   0.35.0 (bundled), `zstd-sys` 2.1.3, `bzip2-sys` 0.1.13, `lzma-sys` 0.1.20 (static),
+   `blake3` 1.8.7, `tikv-jemalloc-sys` 0.6.1, `openssl-sys` 0.9.118 (vendored),
+   `libmimalloc-sys` 0.1.49, `psm` 0.1.32. With no `buildclamp.toml`, 0.1.1 built all of
+   them and 0.2.0 failed one: `tikv-jemalloc-sys`, whose autoconf `configure` runs
+   `./conftest` from `OUT_DIR` ("cannot run C compiled programs"). `observe` then `init`
+   wrote `exec-zones = ["out-dir"]` for it, and the build passed.
+4. **Can a build that failed now pass?** Nothing known.
+
+### Measured
+
+The exec rule is built per held unit from a walk of every directory above each writable
+one, so its cost grows with the entries in `target/<profile>/build/`. The 16-crate corpus
+above (without `tikv-jemalloc-sys` and `openssl-sys`), built in release on the same host,
+one run each, with empty directories added to `target/release/build/`:
+
+| extra `build/` entries | 0.1.1 | 0.2.0 |
+|---|---|---|
+| 0 | 45.9 s | 45.7 s |
+| 500 | 45.4 s | 45.2 s |
+| 2,000 | 45.6 s | 45.6 s |
+| 5,000 | 45.4 s | 44.8 s |
+
+No difference above run-to-run noise at 5,000 entries. The full corpus took 52.0 s
+unhooked, 51.8 s under 0.1.1, and 51.1 s under 0.2.0 with the `init` policy.
+
+### Added
+
+- **Exec is enforced: write xor execute.** A held build script may still run `cc`,
+  `pkg-config`, `git` and anything else on the system, but never a program from a
+  directory it can write — `OUT_DIR`, its private temp dir, any `write-paths`. That is the
+  shape of a dropper (unpack a payload, then run it), and until now nothing refused it:
+  exec was recorded and never refused. On a host with Landlock the kernel refuses it,
+  through the `EXECUTE` right, with the supervisor out of the loop (`enforced:landlock-vN`).
+  Without Landlock but with user namespaces, the noexec writable mounts enforce it
+  (`enforced:mountns-noexec`). With neither, the supervisor still refuses it, but an
+  *allowed* exec is a CONTINUE the unit could race, so the tier is `advisory:seccomp-notify`
+  and says so. A grant without
+  `exec` now refuses every exec outright. Every exec is still recorded. Relative exec paths
+  (`./conftest`) are resolved against the unit's working directory before they are judged
+  and reported.
+
+  Where the host has user namespaces the writable directories are also mounted `noexec`,
+  which closes `ld.so ./written` (the loader maps the file, which Landlock does not see) and
+  gives hosts without Landlock an enforced rung, `enforced:mountns-noexec`. It does **not**
+  stop `sh written.sh` (a read, not an exec) or a program run from a **memfd** (on no path,
+  under no mount); a test pins the memfd case so the statement cannot go stale. On a host
+  with Landlock but no user namespaces the loader trick stays open, and so does `target/` for a
+  held compilation, which rustc loads proc-macros from. Found by review.
+- **`exec-zones` in a grant**, for the crates that build a helper and run it (a cmake
+  `try_run`, an autoconf feature test): `exec-zones = ["out-dir"]` re-allows running from
+  that zone. Each entry must also be in `write-zones` and the grant must include `exec`;
+  either mistake is a policy error, not a silent no-op. A layer ceiling bounds `exec-zones`
+  exactly. `cargo buildclamp init` writes the key when a recorded run executed something
+  from a zone, and the refusal line suggests it with the zone named.
+- **A read allowlist, opt-in: `[defaults] read-allowlist = true`.** Build scripts may read
+  only the system directories, the toolchain (the rustup home, and the cargo home's
+  `registry`, `git` and `bin`, never `credentials.toml` beside them), the workspace members,
+  their own source, the target profile directory, what they may write, and what a grant
+  names in the new `read-paths` key. The rest of the home directory is unreadable, and the
+  credential deny-list still applies inside every allowed root. It closes what the deny-list
+  cannot: measured on `credreader`, now planting a fifth token no list names, the deny-list
+  lets 1 of 5 files and 48 bytes reach `OUT_DIR`; the allowlist lets 0. Needs Landlock;
+  `fs-read` is `none` with the reason on a host without it. `explain` prints what a crate
+  may read, and layer ceilings bound `read-paths`.
+- **`net-destinations` is enforced.** With `net` and a non-empty list, a build script
+  reaches only the listed `host:port`s. It stays in an empty network namespace; each name is
+  resolved when the unit starts and written into a private, read-only `/etc/hosts` (an
+  file in a private directory no unit can write, so none can swap it); and
+  when it connects to a listed address the supervisor makes the TCP connection itself, from
+  the host's namespace, and swaps the connected socket into the unit's descriptor
+  (`SECCOMP_IOCTL_NOTIF_ADDFD`), keeping its non-blocking and close-on-exec flags. An allowed
+  TCP connect is never answered with CONTINUE, so there is nothing to race: the tier is
+  `enforced:netns+connect-proxy`. Every other connect is refused and named, and the refusal
+  suggests the list entry to add. TCP only; glibc's datagram address-ranking connects (port
+  0, then `AF_UNSPEC`) are refused, unrecorded, never continued — glibc ignores the result. It needs user
+  namespaces, seccomp notification and Linux 5.9+ (`SECCOMP_IOCTL_NOTIF_ADDFD` with
+  `SETFD`); short of any of them, or when no listed name resolves, the list cannot be held
+  and the unit gets no network at all (`enforced:netns` or `enforced:seccomp-errno`). Observe
+  mode records a listed connect as granted and an unlisted one as would-be-refused.
+  Enforcement is by address and port as resolved at start, not by name: a destination
+  behind a shared CDN address admits every other site on it, and the docs say so.
+  `explain` prints the list as enforced; the attestation gains an optional
+  `net_destinations_enforced`, derived from the run, and names the units whose list was
+  not held.
+- **`explain` says where a crate may run programs from.**
+- **The `dropexec` fixture** writes `/bin/true` into `OUT_DIR` and runs it; the suite asserts
+  it is refused and named by default, and allowed after `observe` and `init`.
+
+- **Prebuilt binaries, a container image and crates.io.** A release now ships static musl
+  binaries for Linux x86_64 and aarch64 (with `.sha256` and a build-provenance
+  attestation), the image `mancube/buildclamp` for amd64 and arm64 built `FROM scratch`
+  around those same binaries, and the four crates on crates.io, so `cargo install
+  cargo-buildclamp --locked` works. Each binary must reach CI's enforcement floor and pass
+  `selftest --no-network` on its own architecture before it is packaged, and the gate job
+  now runs on an arm64 runner too. See RELEASING.md.
+
+### Changed
+
+- **Behaviour change: a grant that lists `net-destinations` now gets only those.** It was
+  recorded and never enforced. `init` writes the addresses a recorded run reached; replace
+  them with host names before reviewing, or a CDN moving will fail the build.
+- **Behaviour change: a `net-destinations` entry without a port is a policy error.** 0.1
+  accepted `"crates.io"` and recorded it; write `"crates.io:443"`.
+- **Behaviour change: a crate that runs a program it wrote now fails the build** until its
+  grant names the zone in `exec-zones`. Run `cargo buildclamp observe` and `init` to find
+  and write them.
+- **Behaviour change: a grant that omits `exec` now refuses every exec its build script
+  makes**, `cc`, `git` and `pkg-config` included. In 0.1 `exec` was recorded and never
+  refused, so a grant written without it (say `capabilities = ["net"]`, which replaces the
+  defaults) built anyway; that crate's build now fails. Add `exec` to its grant, or run
+  `observe` and `init`. A held compile unit (`hold-compile-units`) is not affected: rustc
+  must run the linker whatever the crate's grant says, so it keeps write xor execute only.
+- **`exec` counts in `--require-enforced` and may be named in a `--require` floor.** Until
+  now it was observe-only and excluded from both. On a host with neither Landlock (5.13+)
+  nor user namespaces exec is advisory, so `--require-enforced` now fails there; and on a
+  host without Landlock so is a crate whose grant drops `exec` (deny-all), which a mount flag
+  cannot express. `doctor` shows which tier a host reaches for the default envelope. The project's own CI lane requires `exec=enforced`.
+- **`doctor` projects exec as `enforced:landlock-vN`** on a Landlock host.
+- `buildclamp-core`: `Capability::is_observe_only` and `FloorError::ObserveOnly` are
+  removed — breaking for a consumer that matched on them; nothing is observe-only now.
+  `Envelope` and `Grant` gain `exec_zones`, `Envelope` gains `read_paths` and
+  `read_allowlist`, `Grant` gains `read_paths` and `Defaults` gains `read_allowlist`, each of
+  which breaks a consumer building these with a struct literal. A report written by 0.1 still reads as it did: its
+  `advisory:seccomp-notify-record` exec tier keeps the exemption it had.
+- `buildclamp-sandbox`: `linux::ns::Prepared::with_noexec` is new, and writable directories
+  are re-attached shallowest-first so a nested zone is never buried by its parent.
+- `buildclamp-sandbox` (breaking for a consumer that builds `Plan` with a struct literal or
+  calls `linux::landlock::Ruleset::build`): `Plan` gains `deny_exec`, `no_exec`, `exec_allowed`, `load_allowed`, `net_allowed` and `hosts`, defaulting
+  to no restriction, so `..Default::default()` callers see no change;
+  `linux::landlock::ExecRule` is new and `Ruleset::build` takes one. Recorded in `API.txt`.
+- `buildclamp-sandbox` (breaking for a consumer that matches `linux::seccomp::Decision`
+  exhaustively or builds `linux::ns::Prepared`): `Decision` gains `Proxy(SocketAddr)`, the
+  `Decider` trait gains `destination_mode` (defaulted, so implementors see no change), and
+  `Prepared::with_hosts_file` mounts a hosts file.
+
+### Fixed
+
+- **`ARCHITECTURE.md` and the product site labelled exec `enforced:seccomp-notify-record`**,
+  while the code reported `advisory:seccomp-notify-record`. Both now describe the 0.2 rule.
+
 ## [0.1.1] - 2026-11-15
 
 ### Security

@@ -241,15 +241,29 @@ pub struct Grant {
     pub capabilities: Vec<Capability>,
     #[serde(default)]
     pub write_zones: Vec<WriteZone>,
+    /// Write zones this crate may also run programs from.
+    ///
+    /// Every writable directory is no-exec by default — write xor execute — so a build
+    /// script cannot write a program and then run it. A crate that builds a helper and
+    /// runs it (a cmake `try_run`, an autoconf feature test) names the zone here. Each
+    /// entry must also be in `write-zones`: a zone the crate cannot write was never
+    /// no-exec, so naming it would grant nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub exec_zones: Vec<WriteZone>,
     #[serde(default)]
     pub write_paths: Vec<String>,
+    /// Further roots this crate may read beneath under `read-allowlist`: an SDK under
+    /// `/opt`, a shared `proto/` directory outside the crate. Absolute, or `~/`-relative;
+    /// the credential deny-list still applies inside them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_paths: Vec<String>,
     #[serde(default)]
     pub env_allow: Vec<String>,
     /// Permit `env-allow` to re-admit a name from [`HARD_DENY`].
     #[serde(default)]
     pub env_allow_secrets: bool,
-    /// Destinations expected for this unit. **Reported, never enforced** — see
-    /// [`crate::envelope::Envelope::net_destinations`].
+    /// The only `host:port`s this unit may reach when the grant also lists `net`.
+    /// **Enforced since 0.2** — see [`crate::envelope::Envelope::net_destinations`].
     #[serde(default)]
     pub net_destinations: Vec<String>,
     /// Why this grant exists. Required, non-empty.
@@ -323,6 +337,23 @@ pub struct Defaults {
     #[serde(default, rename = "env-allowlist")]
     pub env_allowlist: bool,
 
+    /// Let build units read only an allowlist of roots, instead of everything minus the
+    /// credential deny-list.
+    ///
+    /// The roots: the system directories (`/usr`, `/lib*`, `/bin`, `/sbin`, `/etc`, `/proc`,
+    /// `/sys`, `/dev`, `/nix/store`), the toolchain (the rustup home, and the cargo home's
+    /// `registry`, `git` and `bin` — not the cargo home itself, which holds the registry
+    /// token), the workspace members, the unit's own source, the target profile directory,
+    /// and what a grant names in `read-paths`. The rest of the home directory is not on it.
+    ///
+    /// **Off by default, for the reason `withhold-secret-reads` is.** Build scripts read a
+    /// long tail of paths nobody wrote down — `pkg-config` files wherever a distribution put
+    /// them, an SDK under `/opt` — and turning this on underneath existing users would break
+    /// builds for a reason they did not change. With it on, the deny-list still applies
+    /// inside the allowed roots. Needs Landlock; on a host without it the tier says `none`.
+    #[serde(default, rename = "read-allowlist")]
+    pub read_allowlist: bool,
+
     /// Hold the rustc invocations where proc-macros expand, not only build scripts.
     ///
     /// **Off by default, and this is the setting whose default costs the most to get
@@ -388,6 +419,7 @@ impl Default for Defaults {
             env_deny: None,
             withhold_secret_reads: false,
             env_allowlist: false,
+            read_allowlist: false,
             hold_compile_units: false,
             max_active_exceptions: crate::breakglass::DEFAULT_ACTIVE_EXCEPTION_CAP,
             trust_root: Vec::new(),
@@ -655,6 +687,37 @@ pub enum PolicyError {
     ZoneWithoutWrite { crate_name: String, zone: String },
 
     #[error(
+        "the grant for `{crate_name}` lists `{zone}` in `exec-zones` but not in \
+         `write-zones`. Only the zones a crate can write are no-exec, so this would grant \
+         nothing. Add `{zone}` to `write-zones`, or drop it from `exec-zones`."
+    )]
+    ExecZoneNotWritable { crate_name: String, zone: String },
+
+    #[error(
+        "the grant for `{crate_name}` lists `{zone}` in `exec-zones` but does not grant \
+         the `exec` capability, so nothing could run from it. Add \"exec\" to \
+         `capabilities`, or drop the zone."
+    )]
+    ExecZoneWithoutExec { crate_name: String, zone: String },
+
+    #[error(
+        "the grant for `{crate_name}` lists `{path}` in `read-paths`. A read path must be \
+         absolute or start with `~/`, and may not contain `..`: it is resolved on every \
+         machine the policy runs on, and a relative one would mean something different on each."
+    )]
+    ReadPathNotAbsolute { crate_name: String, path: String },
+
+    #[error(
+        "the grant for `{crate_name}` lists `{destination}` in `net-destinations`, which has no \
+         port. Since 0.2 the list is enforced, address and port both: write `host:port`, for \
+         example `crates.io:443`, or `[::1]:8080` for an IPv6 address."
+    )]
+    DestinationWithoutPort {
+        crate_name: String,
+        destination: String,
+    },
+
+    #[error(
         "the `[[exception]]` for `{crate_name}` has no `expires`. Every exception needs \
          one — an exception with no end is an off switch, and this file already has a \
          way to say that out loud (`enforcement = \"disabled\"`). Write a date at most \
@@ -865,11 +928,15 @@ impl Policy {
     /// With it on, the capability comes from the grant's own list and from nowhere else,
     /// which is the same rule every other capability follows.
     fn settle_reads(&self, mut envelope: Envelope) -> Envelope {
-        if self.defaults.withhold_secret_reads {
+        // Either read restriction makes `fs-read` mean what it means for every other
+        // capability: granted by a grant that lists it — which then reads everything — and
+        // withheld otherwise.
+        if self.defaults.withhold_secret_reads || self.defaults.read_allowlist {
             envelope.granted.remove(Capability::FsRead);
         } else {
             envelope.granted.insert(Capability::FsRead);
         }
+        envelope.read_allowlist = self.defaults.read_allowlist;
         // Carried on the envelope rather than passed alongside it, so the report says which
         // rules each unit actually ran under. A reader asking "why did this crate not see
         // my variable?" should find the answer in the document rather than by inferring it
@@ -921,6 +988,41 @@ impl Policy {
                         crate_name: crate_name.clone(),
                         zone: g.write_zones[0].as_str().to_string(),
                     });
+                }
+                for d in &g.net_destinations {
+                    let has_port = d
+                        .rsplit_once(':')
+                        .is_some_and(|(h, p)| !h.is_empty() && p.parse::<u16>().is_ok());
+                    if !has_port {
+                        return Err(PolicyError::DestinationWithoutPort {
+                            crate_name: crate_name.clone(),
+                            destination: d.clone(),
+                        });
+                    }
+                }
+                for p in &g.read_paths {
+                    let ok = (p.starts_with('/') || p.starts_with("~/"))
+                        && !p.split('/').any(|c| c == "..");
+                    if !ok {
+                        return Err(PolicyError::ReadPathNotAbsolute {
+                            crate_name: crate_name.clone(),
+                            path: p.clone(),
+                        });
+                    }
+                }
+                for z in &g.exec_zones {
+                    if !g.write_zones.contains(z) {
+                        return Err(PolicyError::ExecZoneNotWritable {
+                            crate_name: crate_name.clone(),
+                            zone: z.as_str().to_string(),
+                        });
+                    }
+                    if !g.capabilities.contains(&Capability::Exec) {
+                        return Err(PolicyError::ExecZoneWithoutExec {
+                            crate_name: crate_name.clone(),
+                            zone: z.as_str().to_string(),
+                        });
+                    }
                 }
             }
         }
@@ -1203,7 +1305,10 @@ impl Policy {
             // refused at parse time rather than carried — and they widen into the wire
             // type here, at the one boundary where the envelope becomes a document.
             write_zones: g.write_zones.iter().copied().map(Forward::Known).collect(),
+            exec_zones: g.exec_zones.iter().copied().map(Forward::Known).collect(),
             write_paths: g.write_paths.clone(),
+            read_paths: g.read_paths.clone(),
+            read_allowlist: false,
             env_allow: g.env_allow.clone(),
             env_allow_secrets: g.env_allow_secrets,
             // Set by `except_with` after `settle_reads`, never here: an exception widens
@@ -1503,6 +1608,166 @@ mod tests {
             "#,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn the_read_allowlist_withholds_fs_read_and_marks_the_envelope() {
+        let p = Policy::parse(
+            r#"
+            version = 2
+            [defaults]
+            read-allowlist = true
+            [grants."protos"]
+            capabilities = ["fs-write", "exec", "unix"]
+            write-zones = ["out-dir", "tmp"]
+            read-paths = ["~/src/shared-protos", "/opt/protoc"]
+            why = "compiles the shared protos"
+            "#,
+        )
+        .unwrap();
+        let e = p
+            .resolve(
+                &unit("protos", "1.0.0"),
+                UnitKind::BuildScriptCompile,
+                false,
+            )
+            .unwrap();
+        assert!(e.read_allowlist);
+        assert!(
+            !e.permits(Capability::FsRead),
+            "fs-read is what the allowlist restricts"
+        );
+        assert_eq!(e.read_paths, vec!["~/src/shared-protos", "/opt/protoc"]);
+        let d = p
+            .resolve(&unit("other", "1.0.0"), UnitKind::BuildScriptCompile, false)
+            .unwrap();
+        assert!(
+            d.read_allowlist && !d.permits(Capability::FsRead),
+            "defaults too"
+        );
+    }
+
+    #[test]
+    fn a_destination_without_a_port_is_refused() {
+        for bad in ["crates.io", "crates.io:", ":443", "crates.io:https"] {
+            let err = Policy::parse(&format!(
+                r#"
+                version = 2
+                [grants."x"]
+                capabilities = ["net"]
+                net-destinations = ["{bad}"]
+                why = "y"
+                "#
+            ))
+            .unwrap_err();
+            assert!(
+                matches!(err, PolicyError::DestinationWithoutPort { .. }),
+                "{bad}: {err}"
+            );
+        }
+        for good in ["crates.io:443", "[::1]:8080", "127.0.0.1:9"] {
+            Policy::parse(&format!(
+                r#"
+                version = 2
+                [grants."x"]
+                capabilities = ["net"]
+                net-destinations = ["{good}"]
+                why = "y"
+                "#
+            ))
+            .unwrap_or_else(|e| panic!("{good}: {e}"));
+        }
+    }
+
+    #[test]
+    fn a_relative_read_path_is_refused() {
+        for bad in ["shared/protos", "/opt/../root", "~/../other"] {
+            let err = Policy::parse(&format!(
+                r#"
+                version = 2
+                [grants."x"]
+                capabilities = ["fs-write"]
+                write-zones = ["out-dir"]
+                read-paths = ["{bad}"]
+                why = "y"
+                "#
+            ))
+            .unwrap_err();
+            assert!(
+                matches!(err, PolicyError::ReadPathNotAbsolute { .. }),
+                "{bad}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_exec_zone_must_be_a_write_zone_and_needs_exec() {
+        // Only what a crate can write is no-exec, so an exec zone it cannot write grants
+        // nothing — refused, like a write zone without fs-write.
+        let not_writable = Policy::parse(
+            r#"
+            version = 2
+            [grants."cmake-sys"]
+            capabilities = ["fs-write", "exec", "unix"]
+            write-zones = ["tmp"]
+            exec-zones = ["out-dir"]
+            why = "runs its try_run probes"
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(not_writable, PolicyError::ExecZoneNotWritable { .. }),
+            "{not_writable}"
+        );
+        let no_exec = Policy::parse(
+            r#"
+            version = 2
+            [grants."cmake-sys"]
+            capabilities = ["fs-write", "unix"]
+            write-zones = ["out-dir"]
+            exec-zones = ["out-dir"]
+            why = "runs its try_run probes"
+            "#,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(no_exec, PolicyError::ExecZoneWithoutExec { .. }),
+            "{no_exec}"
+        );
+    }
+
+    #[test]
+    fn an_exec_zone_reaches_the_envelope_and_the_defaults_have_none() {
+        let p = Policy::parse(
+            r#"
+            version = 2
+            [grants."cmake-sys"]
+            capabilities = ["fs-write", "exec", "unix"]
+            write-zones = ["out-dir", "tmp"]
+            exec-zones = ["out-dir"]
+            why = "runs its try_run probes"
+            "#,
+        )
+        .unwrap();
+        let e = p
+            .resolve(
+                &unit("cmake-sys", "0.1.0"),
+                UnitKind::BuildScriptCompile,
+                false,
+            )
+            .unwrap();
+        assert_eq!(
+            e.known_exec_zones().collect::<Vec<_>>(),
+            vec![WriteZone::OutDir]
+        );
+        let d = p
+            .resolve(&unit("other", "1.0.0"), UnitKind::BuildScriptCompile, false)
+            .unwrap();
+        assert_eq!(
+            d.known_exec_zones().count(),
+            0,
+            "write xor execute is the default"
+        );
     }
 
     #[test]

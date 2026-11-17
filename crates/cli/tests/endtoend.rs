@@ -29,6 +29,25 @@ fn fixtures() -> PathBuf {
         .join("tests/fixtures")
 }
 
+/// Whether the supervisor is available: a refusal it makes is what puts a request in the
+/// report, so an assertion about the report needs it as well as a namespace.
+fn host_has_notify() -> bool {
+    let out = Command::new(bin())
+        .args(["buildclamp", "doctor", "--json"])
+        .output()
+        .expect("doctor runs");
+    assert!(
+        out.status.success(),
+        "`doctor --json` failed, so this suite cannot tell whether the host has seccomp \
+         notification; refusing to skip on an answer it could not establish"
+    );
+    let host: serde_json::Value =
+        serde_json::from_slice(&out.stdout).expect("doctor --json emits HostCapabilities");
+    host["seccomp_user_notif"]
+        .as_bool()
+        .expect("HostCapabilities carries seccomp_user_notif")
+}
+
 /// Whether this host can demonstrate enforcement at all.
 ///
 /// Asked of the tool itself, so the suite and the tool agree about the host — but asked
@@ -492,4 +511,209 @@ fn a_build_script_compiled_before_buildclamp_was_involved_is_still_held() {
         !v.persistence_file().exists(),
         "a build script compiled before buildclamp was involved ran unheld:\n{combined}"
     );
+}
+
+#[test]
+fn a_build_script_cannot_run_a_program_it_wrote_into_out_dir() {
+    // Write xor execute: the dropper shape — write a payload where the script may write,
+    // then run it — refused by default, and the refusal named like any other.
+    if !host_can_enforce() || !host_has_notify() {
+        eprintln!(
+            "SKIP: the exit code and the report line come from the supervisor's refusal; \
+             this host lacks user namespaces or seccomp notification"
+        );
+        return;
+    }
+    let v = Victim::new(&["dropexec"]);
+    let out = v.run(&["build"]);
+    let err = stderr(&out);
+    assert_eq!(
+        code(&out),
+        2,
+        "the refused exec must fail the build:\n{err}"
+    );
+    assert!(
+        err.contains("dropexec-step:1:write-program:ok"),
+        "writing the program into OUT_DIR is allowed; only running it is not:\n{err}"
+    );
+    assert!(
+        err.contains("dropexec-step:2:run-dropped:err:PermissionDenied"),
+        "the dropped program must not have run:\n{err}"
+    );
+    let report = v.report();
+    let refused: Vec<serde_json::Value> = report["units"]
+        .as_array()
+        .expect("units")
+        .iter()
+        .filter(|u| u["id"]["name"] == "dropexec")
+        .flat_map(|u| u["requests"].as_array().cloned().unwrap_or_default())
+        .filter(|r| r["capability"] == "exec" && r["outcome"]["outcome"] == "ungranted")
+        .collect();
+    assert!(
+        refused
+            .iter()
+            .any(|r| r["target"].as_str().unwrap_or("").ends_with("/out/dropped")),
+        "the report must name the refused exec and where it was: {refused:?}"
+    );
+}
+
+#[test]
+fn an_exec_zone_lets_a_build_script_run_what_it_built() {
+    // The legitimate half of the same shape, through the adoption path a user would take:
+    // observe records the refused exec, init names the zone in `exec-zones`, and the next
+    // enforcing build runs the program.
+    if !host_can_enforce() || !host_has_notify() {
+        eprintln!("SKIP: observe records a would-be refusal only through seccomp notification");
+        return;
+    }
+    let v = Victim::new(&["dropexec"]);
+    assert_eq!(code(&v.run(&["observe"])), 0, "observe refuses nothing");
+    // Not just "exit 0": the program really ran. A noexec mount or a Landlock rule leaking
+    // into observe would fail it, and the fixture swallows that, so only its own record
+    // can tell. Cargo keeps a successful build script's stderr in its unit directory.
+    let ran = walk_files(&v.path().join("target"))
+        .into_iter()
+        .filter(|p| {
+            p.file_name().is_some_and(|n| n == "stderr") && p.to_string_lossy().contains("dropexec")
+        })
+        .any(|p| {
+            std::fs::read_to_string(p)
+                .unwrap_or_default()
+                .contains("dropexec-step:2:run-dropped:ok")
+        });
+    assert!(ran, "under observe the dropped program must run");
+    let init = v.run(&["init"]);
+    assert_eq!(code(&init), 0, "init:\n{}", stderr(&init));
+    let policy = std::fs::read_to_string(v.path().join("buildclamp.toml")).unwrap();
+    assert!(
+        policy.contains("exec-zones = [\"out-dir\"]"),
+        "init must name the zone the program ran from:\n{policy}"
+    );
+    std::fs::remove_dir_all(v.path().join("target")).unwrap();
+    let out = v.run(&["build"]);
+    let err = stderr(&out);
+    assert_eq!(code(&out), 0, "with the exec zone the build passes:\n{err}");
+}
+
+/// Every file beneath `dir`.
+fn walk_files(dir: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    for e in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            out.extend(walk_files(&p));
+        } else {
+            out.push(p);
+        }
+    }
+    out
+}
+
+#[test]
+fn an_ordinary_build_script_passes_under_the_read_allowlist() {
+    // The false-positive gate for the allowlist: `benign` reads its manifest directory, asks
+    // `cc` for its version and writes generated code — the shape of `cc`, `bindgen` and
+    // `prost-build`. If the allowlist broke that, nobody would leave it on.
+    if !host_can_enforce() {
+        eprintln!("SKIP: this host has no user namespaces");
+        return;
+    }
+    let v = Victim::new(&["benign"]);
+    std::fs::write(
+        v.path().join("buildclamp.toml"),
+        "version = 2\n\n[defaults]\nread-allowlist = true\n",
+    )
+    .unwrap();
+    let out = v.run(&["build"]);
+    let err = stderr(&out);
+    assert_eq!(
+        code(&out),
+        0,
+        "benign must build under the read allowlist:\n{err}"
+    );
+    // The summary is on stdout; cargo's own output is on stderr.
+    let summary = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        summary.contains("nothing asked for more than its envelope"),
+        "{summary}\n{err}"
+    );
+}
+
+#[test]
+fn a_build_script_reaches_only_its_listed_destinations() {
+    // `net` with a destination list: the listed one, by name, through the private hosts
+    // file and the supervisor's connection; anything else refused like the network itself.
+    let kernel_has_addfd = {
+        let out = Command::new(bin())
+            .args(["buildclamp", "doctor", "--json"])
+            .output()
+            .expect("doctor runs");
+        let host: serde_json::Value = serde_json::from_slice(&out.stdout).expect("doctor --json");
+        let mut v = host["kernel"]
+            .as_str()
+            .unwrap_or("")
+            .split(|c: char| !c.is_ascii_digit())
+            .filter(|p| !p.is_empty())
+            .map(|p| p.parse::<u32>().unwrap_or(0));
+        matches!((v.next(), v.next()), (Some(a), Some(b)) if (a, b) >= (5, 9))
+    };
+    if !host_can_enforce() || !host_has_notify() || !kernel_has_addfd {
+        eprintln!(
+            "SKIP: destinations need an empty network namespace, the supervisor and Linux 5.9+"
+        );
+        return;
+    }
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let other = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let other_port = other.local_addr().unwrap().port();
+    std::thread::spawn(move || for _ in listener.incoming() {});
+    std::thread::spawn(move || for _ in other.incoming() {});
+
+    let v = Victim::new(&["netlegit"]);
+    std::fs::write(
+        v.path().join("buildclamp.toml"),
+        format!(
+            "version = 2\n\n[grants.netlegit]\ncapabilities = [\"net\", \"fs-write\", \"exec\", \"unix\"]\n\
+             write-zones = [\"out-dir\", \"tmp\"]\nnet-destinations = [\"localhost:{port}\"]\n\
+             why = \"fetches its pinned tarball from the harness\"\nreviewed = true\n"
+        ),
+    )
+    .unwrap();
+    let build = |endpoint: String| {
+        let _ = std::fs::remove_dir_all(v.path().join("target"));
+        Command::new(bin())
+            .args(["buildclamp", "build"])
+            .current_dir(v.path())
+            .env("HOME", v.path().join("home"))
+            .env("NETLEGIT_ENDPOINT", endpoint)
+            .output()
+            .expect("the binary runs")
+    };
+
+    let ok = build(format!("localhost:{port}"));
+    assert_eq!(
+        code(&ok),
+        0,
+        "the listed destination must be reachable:\n{}",
+        stderr(&ok)
+    );
+    let fetched = walk_files(&v.path().join("target"))
+        .into_iter()
+        .filter(|p| p.file_name().is_some_and(|n| n == "fetched.rs"))
+        .any(|p| {
+            std::fs::read_to_string(p)
+                .unwrap_or_default()
+                .contains("FETCHED: bool = true")
+        });
+    assert!(fetched, "the build script's own record says it fetched");
+
+    let refused = build(format!("127.0.0.1:{other_port}"));
+    let err = stderr(&refused);
+    assert_eq!(
+        code(&refused),
+        2,
+        "an unlisted destination fails the build:\n{err}"
+    );
+    assert!(err.contains("netlegit:fetch:err:PermissionDenied"), "{err}");
 }

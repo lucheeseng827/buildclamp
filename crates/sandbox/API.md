@@ -10,7 +10,7 @@ complaint — a crate whose API moves under its consumers is one nobody depends 
 
 | item | what it is |
 |---|---|
-| `Plan` and every field | the envelope: what a unit may do, where it may write, what it may read |
+| `Plan` and every field | the envelope: what a unit may do, where it may write, what it may read, what it may run and which addresses it may reach. 0.2 added `deny_exec`, `no_exec`, `exec_allowed`, `load_allowed`, `read_allowed`, `net_allowed` and `hosts`: their defaults restrict nothing new, but a struct literal without `..Default::default()` must name them |
 | `Plan::default()` | so `Plan { allow_net: true, ..Default::default() }` keeps working |
 | `Plan::hold(&self, Command) -> Result<Held, HoldError>` | the whole arrow, in one call |
 | `Held` and every field | the tiers that applied, everything the unit asked for, how it ended |

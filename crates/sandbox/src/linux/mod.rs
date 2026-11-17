@@ -50,6 +50,14 @@ pub fn hold(plan: &Plan, mut command: Command) -> Result<Held, HoldError> {
     // somewhere else. Observe mode's answer has to be what the build does on the machine it
     // normally runs on, or the policy generated from it describes a build nobody has.
     let enforcing = use_ns && !plan.observe_only;
+    // Destination mode, decided once and used by the decider, the supervisor and the tier
+    // alike, so they cannot disagree: an empty network namespace, the supervisor, and a
+    // kernel with SECCOMP_IOCTL_NOTIF_ADDFD's SETFD (5.9; pidfd_getfd is 5.6). Short of any
+    // of them the list cannot be held and the unit gets no network, which `netns` reports.
+    let destinations_held = enforcing
+        && use_notify
+        && !plan.net_allowed.is_empty()
+        && kernel_at_least(&host.kernel, 5, 9);
 
     // The Landlock ruleset, built HERE — in the parent, where allocating is safe. The
     // child issues one syscall against the descriptor and nothing else; see
@@ -62,12 +70,42 @@ pub fn hold(plan: &Plan, mut command: Command) -> Result<Held, HoldError> {
     // A ruleset that cannot be built is reported and then ignored: the mount namespace is
     // still there, and refusing the unit over a mechanism we have a fallback for would be
     // a worse trade than taking the fallback and naming it.
+    // The program the child is about to exec, which every exec rule allows: refusing it
+    // would refuse the unit itself. Absolute here, because both Landlock and the decider
+    // compare against the path the kernel will see.
+    let exec_program = program_path(&command);
+    // The no-exec directories in both spellings. Landlock keys on the canonical one, and a
+    // symlinked ancestor would otherwise let the complement grant the real directory under
+    // its other name; the decider compares paths lexically, so it gets both.
+    let no_exec_canonical: Vec<std::path::PathBuf> = plan
+        .no_exec
+        .iter()
+        .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
+        .collect();
+    let exec_allowed_canonical: Vec<std::path::PathBuf> = plan
+        .exec_allowed
+        .iter()
+        .map(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()))
+        .collect();
+    let exec_rule = landlock::ExecRule {
+        deny_all: plan.deny_exec,
+        no_exec: &no_exec_canonical,
+        exec_allowed: &exec_allowed_canonical,
+        program: exec_program.as_deref(),
+    };
+
     let landlock_ruleset = if plan.observe_only {
         None
     } else {
         match host.landlock_abi {
             Some(abi) => {
-                match landlock::Ruleset::build(abi, &plan.writable, &plan.withheld_reads) {
+                match landlock::Ruleset::build(
+                    abi,
+                    &plan.writable,
+                    &plan.withheld_reads,
+                    &plan.read_allowed,
+                    &exec_rule,
+                ) {
                     Ok(r) => r,
                     Err(e) => {
                         eprintln!(
@@ -82,12 +120,17 @@ pub fn hold(plan: &Plan, mut command: Command) -> Result<Held, HoldError> {
         }
     };
 
-    let tiers = plan_tiers(
-        plan,
-        enforcing,
-        use_notify,
-        landlock_ruleset.as_ref().map(|r| r.mechanism()),
-    );
+    // The hosts file, made here in a fresh 0700 directory under the host's temp directory —
+    // not anywhere the caller named, which may be a directory units can write. A held unit
+    // can write only its own writable directories, so it cannot swap the file before the
+    // child mounts it. Removed when `hosts` drops, after the unit. A failure fails the unit
+    // rather than running it with names that silently do not resolve.
+    let hosts = match plan.hosts.as_deref().filter(|_| enforcing) {
+        Some(text) => Some(hosts_file(text).map_err(|e| {
+            HoldError::Setup(format!("could not make the private hosts file: {e}"))
+        })?),
+        None => None,
+    };
 
     // Everything the child will need, built here where allocating is safe. After the fork
     // the child cannot allocate: the allocator may be held by a thread that does not exist
@@ -102,7 +145,35 @@ pub fn hold(plan: &Plan, mut command: Command) -> Result<Held, HoldError> {
             .map(|p| p.to_path_buf())
             .as_deref(),
     )
+    .map_err(|e| HoldError::Setup(e.to_string()))?
+    .with_noexec(
+        // Observe refuses nothing. It never builds the read-only tree these binds belong
+        // to, so this is belt and braces — but the rule should not depend on that.
+        if plan.observe_only {
+            &[]
+        } else {
+            &plan.no_exec
+        },
+        &plan.exec_allowed,
+        &plan.load_allowed,
+        exec_program.as_deref(),
+    )
+    .with_hosts_file(hosts.as_ref().map(|h| h.0.join("hosts")).as_deref())
     .map_err(|e| HoldError::Setup(e.to_string()))?;
+
+    // Labelled after the mounts are decided, from the same flags: a bind left executable —
+    // the one holding the program, or one holding the proc-macros rustc loads — is not
+    // covered by the mount, so the mount must not be named as what enforced exec.
+    let some_bind_left_exec =
+        !prepared.every_no_exec_bind_is_noexec(&plan.no_exec, &plan.exec_allowed);
+    let tiers = plan_tiers(
+        plan,
+        enforcing,
+        use_notify,
+        landlock_ruleset.as_ref().map(|r| r.mechanism()),
+        some_bind_left_exec,
+        destinations_held,
+    );
 
     let program = bpf::build(&bpf::FilterOptions {
         // Writes are notified only when asked for, or when there is no kernel-enforced
@@ -179,7 +250,25 @@ pub fn hold(plan: &Plan, mut command: Command) -> Result<Held, HoldError> {
     // deadlocking a spike; reversing these two statements deadlocks again.
     let (stop_tx, stop_rx) = mpsc::channel();
     let (req_tx, req_rx) = mpsc::channel();
-    let decider = plan.decider();
+    let decider = {
+        let mut p = plan.clone();
+        p.no_exec.extend(no_exec_canonical.iter().cloned());
+        p.exec_allowed
+            .extend(exec_allowed_canonical.iter().cloned());
+        // Destinations only where the unit is in an empty network namespace; see
+        // `PlanDecider::net_allowed` for why that is the condition.
+        p.decider(
+            exec_program.clone(),
+            // Observe gets the list too, so a listed connect is recorded as granted and an
+            // unlisted one as would-be-refused — what enforcement would do — rather than every
+            // connect of a listed crate reading as refused and feeding `init` that.
+            if destinations_held || plan.observe_only {
+                plan.net_allowed.clone()
+            } else {
+                Vec::new()
+            },
+        )
+    };
     let macros = plan.proc_macro_objects.clone();
     let skip_exec = plan.skip_exec_target.clone();
     let supervisor = if install_filter {
@@ -235,6 +324,8 @@ pub(crate) fn plan_tiers(
     use_ns: bool,
     use_notify: bool,
     landlock: Option<String>,
+    some_bind_left_exec: bool,
+    destinations_held: bool,
 ) -> BTreeMap<Forward<Capability>, Tier> {
     let mut t: BTreeMap<Forward<Capability>, Tier> = BTreeMap::new();
 
@@ -252,6 +343,12 @@ pub(crate) fn plan_tiers(
         Capability::Net.into(),
         if plan.allow_net {
             none("the policy grants this unit the network")
+        } else if destinations_held {
+            // An empty namespace, and every allowed connection made by the supervisor to
+            // the address it decided on — no CONTINUE, so nothing to race. Without the
+            // supervisor the list cannot be honoured and the namespace denies everything,
+            // which the plain `netns` arm below reports.
+            enforced("netns+connect-proxy")
         } else if use_ns {
             enforced("netns")
         } else if use_notify {
@@ -295,7 +392,7 @@ pub(crate) fn plan_tiers(
     // the same distinction `disable_overrides` exists for one level up.
     t.insert(
         Capability::FsRead.into(),
-        if plan.withheld_reads.is_empty() {
+        if plan.withheld_reads.is_empty() && plan.read_allowed.is_empty() {
             none("the policy withholds no reads; every path on this host is readable")
         } else if let Some(mechanism) = landlock.as_deref() {
             enforced(mechanism)
@@ -306,8 +403,9 @@ pub(crate) fn plan_tiers(
             // every build, buying a tier that is defeatable by construction. Refusing to
             // offer it is the honest answer: this host cannot restrict reads.
             none(
-                "landlock is absent on this host, so withheld paths cannot be made \
-                 unreadable; a mount namespace cannot express a read restriction and \
+                "landlock is absent on this host, so reads cannot be restricted: withheld \
+                 paths stay readable and a read allowlist cannot apply; a mount namespace \
+                 cannot express a read restriction and \
                  seccomp could only do it advisorily, at 10–40 µs on every file rustc opens",
             )
         },
@@ -320,8 +418,8 @@ pub(crate) fn plan_tiers(
         // namespace is still in place underneath — the effective policy is the
         // intersection — so this label understates the enforcement rather than
         // overstating it, which is the only direction a tier is allowed to be wrong in.
-        if let Some(mechanism) = landlock {
-            enforced(&mechanism)
+        if let Some(mechanism) = landlock.as_deref() {
+            enforced(mechanism)
         } else if use_ns {
             enforced("mountns-ro")
         } else if use_notify {
@@ -371,29 +469,111 @@ pub(crate) fn plan_tiers(
         },
     );
 
+    // Exec is enforced by Landlock's EXECUTE right and by nothing else. The supervisor can
+    // refuse an exec authoritatively, but it can only *allow* one through a CONTINUE, after
+    // which the kernel re-reads the path — so a unit could show it an allowed path and run
+    // another. A CONTINUE-decided capability is advisory by this project's own definition
+    // (`crates/sandbox/tests/no_continue_is_enforced.rs`); Landlock checks the file the
+    // kernel actually opens, with no window to race, which is what earns `enforced`.
     t.insert(
         Capability::Exec.into(),
-        if use_notify {
-            // Advisory, NOT enforced, and the distinction is the same one the sibling test
-            // `a_seccomp_errno_refusal_is_enforcement_but_a_notification_decision_is_not`
-            // draws for the network. Exec is *recorded* and never refused — see
-            // `PlanDecider::decide`, whose `_ => Decision::Allow` arm and comment say so —
-            // and the recording arrives by seccomp notification, answered with CONTINUE. The
-            // kernel re-reads the path after that answer, so the binary that runs can differ
-            // from the one recorded. A capability the kernel never refuses, decided through
-            // the racy mechanism, is advisory by this project's own definition; calling it
-            // `enforced` was promoting a CONTINUE observation to a guarantee, which
-            // `crates/sandbox/tests/no_continue_is_enforced.rs` now forbids.
+        if !plan.restricts_exec() {
+            none("the plan restricts no exec")
+        } else if let Some(mechanism) = landlock.as_deref() {
+            // Named first, as fs-write names it: where the mount namespace is also in place
+            // its noexec writable binds sit underneath and close what Landlock does not see —
+            // the loader mapping a written file — so the label understates, never overstates.
+            enforced(mechanism)
+        } else if use_ns && !plan.deny_exec && !some_bind_left_exec {
+            // No Landlock, but the writable directories are mounted noexec: neither `execve`
+            // nor `mmap(PROT_EXEC)` of a file on them succeeds. It cannot express "no exec at
+            // all", which is why deny-all falls through to the supervisor below.
+            enforced("mountns-noexec")
+        } else if use_notify {
             advisory(
-                "seccomp-notify-record",
-                "exec is recorded, never refused, and the kernel re-reads the path after                  the notification is answered, so the binary that runs can differ from the                  one recorded; a spawned process does inherit every namespace and the                  seccomp filter, so it is held as tightly as its parent",
+                "seccomp-notify",
+                "a refused exec never runs, but an allowed one is answered with CONTINUE and \
+                 the kernel re-reads the path afterwards, so a unit can show the supervisor an \
+                 allowed program and run another; and the supervisor judges the path as \
+                 written, so `/proc/self/fd/N` or `/proc/self/cwd/x` naming a written file \
+                 is not seen as inside a no-exec directory. Landlock is what closes both, \
+                 and this host does not have it",
             )
         } else {
-            none("seccomp notification is unavailable, so exec cannot be recorded")
+            none("neither Landlock nor seccomp notification is available, so exec cannot be restricted")
         },
     );
 
     t
+}
+
+/// The absolute path the held command will `execve`, or `None` when it cannot be known.
+///
+/// Mirrors what `Command::spawn` does with the program: an absolute path is used as is, a
+/// relative one with a slash is resolved against the command's directory, and a bare name
+/// is searched for on the `PATH` the child will have.
+fn program_path(command: &Command) -> Option<std::path::PathBuf> {
+    let prog = std::path::Path::new(command.get_program());
+    if prog.is_absolute() {
+        return Some(prog.to_path_buf());
+    }
+    if prog.components().count() > 1 {
+        let base = match command.get_current_dir() {
+            Some(d) => d.to_path_buf(),
+            None => std::env::current_dir().ok()?,
+        };
+        return Some(base.join(prog));
+    }
+    let path = command
+        .get_envs()
+        .find(|(k, _)| *k == "PATH")
+        .and_then(|(_, v)| v.map(|v| v.to_os_string()))
+        .or_else(|| std::env::var_os("PATH"))?;
+    std::env::split_paths(&path)
+        .map(|d| d.join(prog))
+        .find(|p| p.is_file())
+}
+
+/// Whether a `uname -r` release is at least `major.minor`. An unparsable release is not.
+/// A private directory holding a `hosts` file; removed on drop.
+struct HostsDir(std::path::PathBuf);
+
+impl Drop for HostsDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// `text` as `hosts` in a fresh 0700 directory under the temp directory. `create` fails on
+/// anything already at the name, so nothing planted there is followed.
+fn hosts_file(text: &str) -> std::io::Result<HostsDir> {
+    use std::io::Write;
+    use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir = std::env::temp_dir().join(format!("buildclamp-hosts-{}-{nanos}", std::process::id()));
+    std::fs::DirBuilder::new().mode(0o700).create(&dir)?;
+    let dir = HostsDir(dir);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o444)
+        .open(dir.0.join("hosts"))?
+        .write_all(text.as_bytes())?;
+    Ok(dir)
+}
+
+fn kernel_at_least(release: &str, major: u32, minor: u32) -> bool {
+    let mut parts = release
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|p| !p.is_empty())
+        .map(|p| p.parse::<u32>().unwrap_or(0));
+    match (parts.next(), parts.next()) {
+        (Some(a), Some(b)) => (a, b) >= (major, minor),
+        _ => false,
+    }
 }
 
 fn exit_signal(status: &std::process::ExitStatus) -> Option<i32> {
@@ -512,11 +692,70 @@ mod tests {
     use super::*;
 
     #[test]
+    fn observe_with_a_destination_list_reports_no_enforcement_whatever_the_host() {
+        // Observe runs on the real network; a destination list must not make its net tier
+        // read as enforced, or an attestation would count an open run as held.
+        let plan = Plan {
+            observe_only: true,
+            net_allowed: vec!["127.0.0.1:443".parse().unwrap()],
+            ..Plan::default()
+        };
+        for (ns, notify) in [(true, true), (false, true), (true, false)] {
+            let t = plan_tiers(&plan, ns, notify, Some("landlock-v7".into()), false, false);
+            let net = t.get(&Capability::Net.into()).map(Tier::label).unwrap();
+            assert_eq!(net, "none", "ns={ns} notify={notify}");
+        }
+    }
+
+    #[test]
+    fn kernel_releases_compare_by_major_and_minor() {
+        assert!(kernel_at_least("6.18.40.1-microsoft-standard-WSL2", 5, 9));
+        assert!(kernel_at_least("5.9.0", 5, 9));
+        assert!(!kernel_at_least("5.8.18-arch1", 5, 9));
+        assert!(kernel_at_least("10.0", 5, 9), "not a string comparison");
+        assert!(!kernel_at_least("garbage", 5, 9));
+    }
+
+    #[test]
+    fn the_exec_ladder_is_landlock_then_the_noexec_mount_then_advisory() {
+        let label = |plan: &Plan, ns: bool, ll: Option<&str>| {
+            plan_tiers(plan, ns, true, ll.map(str::to_string), false, false)
+                .get(&Capability::Exec.into())
+                .map(Tier::label)
+                .unwrap()
+        };
+        let wxe = Plan {
+            no_exec: vec!["/out".into()],
+            ..Plan::default()
+        };
+        assert_eq!(
+            label(&wxe, true, Some("landlock-v7")),
+            "enforced:landlock-v7"
+        );
+        assert_eq!(label(&wxe, true, None), "enforced:mountns-noexec");
+        assert_eq!(label(&wxe, false, None), "advisory:seccomp-notify");
+        // A bind the mounts had to leave executable (a load-allowed `target`, the program's
+        // own) means the mount does not cover exec, so it is not named.
+        let partly = plan_tiers(&wxe, true, true, None, true, false)
+            .get(&Capability::Exec.into())
+            .map(Tier::label)
+            .unwrap();
+        assert_eq!(partly, "advisory:seccomp-notify");
+        // A mount flag cannot say "no exec at all", so deny-all skips that rung.
+        let deny = Plan {
+            deny_exec: true,
+            ..Plan::default()
+        };
+        assert_eq!(label(&deny, true, None), "advisory:seccomp-notify");
+        assert_eq!(label(&Plan::default(), true, None), "none");
+    }
+
+    #[test]
     fn without_a_namespace_the_environment_tier_admits_the_proc_hole() {
         // Scrubbing a unit's own environment does not stop it reading cargo's through
         // /proc. Reporting that as "enforced" would be the overstatement this project
         // exists to avoid, and a fixture in this repository proves the hole is real.
-        let t = plan_tiers(&Plan::default(), false, true, None);
+        let t = plan_tiers(&Plan::default(), false, true, None, false, false);
         let (_, tier) = t.get_key_value(&Capability::EnvSecret.into()).unwrap();
         match tier {
             Tier::Advisory { limitation, .. } => {
@@ -534,7 +773,7 @@ mod tests {
         // it with EPERM. Naming `pidns` here credited the wrong mechanism — and it was
         // additionally wrong because unshare(CLONE_NEWPID) moves the next process forked,
         // not the caller, and the unit execs without forking.
-        let t = plan_tiers(&Plan::default(), true, true, None);
+        let t = plan_tiers(&Plan::default(), true, true, None, false, false);
         let (_, tier) = t.get_key_value(&Capability::EnvSecret.into()).unwrap();
         match tier {
             Tier::Enforced { mechanism } => {
@@ -557,7 +796,7 @@ mod tests {
     fn a_seccomp_errno_refusal_is_enforcement_but_a_notification_decision_is_not() {
         // The distinction is real: an errno response means the syscall never runs, while
         // an allowed call is re-read by the kernel after we answer.
-        let t = plan_tiers(&Plan::default(), false, true, None);
+        let t = plan_tiers(&Plan::default(), false, true, None, false, false);
         let net = t.get_key_value(&Capability::Net.into()).unwrap();
         assert!(net.1.is_enforced(), "an errno refusal is authoritative");
         let fs = t.get_key_value(&Capability::FsWrite.into()).unwrap();
@@ -581,7 +820,7 @@ mod tests {
             allow_net: true,
             ..Default::default()
         };
-        let t = plan_tiers(&plan, true, true, None);
+        let t = plan_tiers(&plan, true, true, None, false, false);
         let net = t.get_key_value(&Capability::Net.into()).unwrap();
         assert!(matches!(net.1, Tier::None { .. }));
     }
@@ -600,7 +839,7 @@ mod tests {
             (true, true, Some("landlock-v7".to_string())),
             (false, true, Some("landlock-v1".to_string())),
         ] {
-            let t = plan_tiers(&Plan::default(), ns, notify, ll);
+            let t = plan_tiers(&Plan::default(), ns, notify, ll, false, false);
             for cap in Capability::ALL {
                 assert!(
                     t.contains_key(&cap.into()),

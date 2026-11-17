@@ -47,6 +47,94 @@ pub fn refusal_line(unit: &UnitRecord) -> String {
     if more > 0 {
         s.push_str(&format!("  and {more} further ungranted request(s)\n"));
     }
+    // An exec the crate is granted, refused because it ran from a directory it can write:
+    // the fix is an exec zone, not a capability it already has. Suggesting the capability
+    // list again would hand the person a grant that changes nothing.
+    let exec_zone = (first.capability.copied() == Some(Capability::Exec)
+        && unit.envelope.permits(Capability::Exec))
+    .then(|| unit.exec_zone_of(&first.target))
+    .flatten();
+    // A connection the crate is granted the network for, refused because its grant lists
+    // destinations and this is not one: the fix is the list, not the capability.
+    if first.capability.copied() == Some(Capability::Net)
+        && unit.envelope.permits(Capability::Net)
+        && !unit.envelope.net_destinations.is_empty()
+    {
+        let held = unit
+            .tiers
+            .get(&Capability::Net.into())
+            .map(buildclamp_core::Tier::label)
+            .as_deref()
+            == Some("enforced:netns+connect-proxy");
+        if !held {
+            // The list was not in force: this host could not hold one, so the unit had no
+            // network at all. Adding to the list would change nothing here.
+            s.push_str(&format!(
+                "  its grant lists destinations, but the list was not in force, so the unit ran \
+                 with no network. Either none of the listed names resolved when it started — \
+                 the build log above says which did not — or this host cannot hold a list (it \
+                 needs user namespaces, seccomp notification and Linux 5.9+; `cargo buildclamp \
+                 doctor` shows what is missing).\n  \
+                 or run `cargo buildclamp explain {name}` to see the whole envelope.\n",
+                name = unit.id.name,
+            ));
+            return s;
+        }
+        // Listed, but the supervisor could not take the unit's socket over to connect it:
+        // the list is right and adding to it would change nothing.
+        const EACCES: i32 = 13; // Linux; the only platform a list is held on.
+        if matches!(first.outcome, buildclamp_core::Outcome::Ungranted { errno } if errno == EACCES)
+        {
+            s.push_str(
+                "  that destination is listed, but the supervisor could not take over the unit's \
+                 socket to connect it (pidfd_getfd was refused — Yama `ptrace_scope` 2 or \
+                 higher does that), so the connection was refused. The list is not the problem.\n",
+            );
+            return s;
+        }
+        s.push_str(&format!(
+            "  its grant lists the destinations it may reach, and {target} is not one of them.\n  \
+             if it should be, add the host name it belongs to — not the address, so the list \
+             survives a CDN moving:\n\
+             \x20   [grants.\"{name}\"]\n\
+             \x20   net-destinations = [{have}, \"<host>:<port>\"]\n\
+             \x20 or run `cargo buildclamp explain {name}` to see the whole envelope.\n",
+            target = first.target,
+            name = unit.id.name,
+            have = unit
+                .envelope
+                .net_destinations
+                .iter()
+                .map(|d| format!("\"{d}\""))
+                .collect::<Vec<_>>()
+                .join(", "),
+        ));
+        return s;
+    }
+    if let Some(zone) = exec_zone {
+        let zones: Vec<String> = unit
+            .envelope
+            .known_zones()
+            .chain(std::iter::once(zone))
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .map(|z| format!("\"{z}\""))
+            .collect();
+        s.push_str(&format!(
+            "  it ran a program from `{zone}`, which it can write: write xor execute.\n  \
+             if it builds that program itself, allow running it from there:\n\
+             \x20   [grants.\"{name}\"]\n\
+             \x20   capabilities = [{caps}]\n\
+             \x20   write-zones = [{zones}]\n\
+             \x20   exec-zones = [\"{zone}\"]\n\
+             \x20   why = \"...\"\n\
+             \x20 or run `cargo buildclamp explain {name}` to see the whole envelope.\n",
+            name = unit.id.name,
+            caps = wanted_capabilities(unit),
+            zones = zones.join(", "),
+        ));
+        return s;
+    }
     s.push_str(&format!(
         "  to allow it, add a grant with a reason:\n\
          \x20   [grants.\"{name}\"]\n\
@@ -769,11 +857,42 @@ pub fn explain(
             }
         ));
     }
+    // Where it may run programs from, said in the terms of the rule: everywhere except what
+    // it can write, unless a grant re-allowed a zone. A crate without `exec` runs nothing.
+    if envelope.permits(Capability::Exec) {
+        let again: Vec<String> = envelope
+            .exec_zones
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        out.push_str(&format!(
+            "  may run    programs from anywhere it cannot write{}\n",
+            if again.is_empty() {
+                String::new()
+            } else {
+                format!(", and from {}", again.join(", "))
+            }
+        ));
+    } else {
+        out.push_str("  may run    nothing — the grant does not include `exec`\n");
+    }
+    // Reads, only when the allowlist applies to this crate: otherwise there is nothing to
+    // say beyond the withheld list printed below.
+    if envelope.read_allowlist && !envelope.permits(Capability::FsRead) {
+        out.push_str(
+            "  may read   the system, the toolchain, the workspace, its own source and the \
+             target directory",
+        );
+        if !envelope.read_paths.is_empty() {
+            out.push_str(&format!(", and {}", envelope.read_paths.join(", ")));
+        }
+        out.push_str(" (read-allowlist; nothing else in the home directory)\n");
+    }
     if !envelope.net_destinations.is_empty() {
         out.push_str(&format!(
-            "  expects    {}\n  {}\n",
+            "  reaches    {}\n  {}\n",
             envelope.net_destinations.join(", "),
-            "(recorded for the report; buildclamp does NOT enforce a destination list)"
+            "(enforced: TCP to the addresses these resolved to at start; a shared CDN address admits other sites on it)"
         ));
     }
     if !withheld.is_empty() {
@@ -834,6 +953,27 @@ mod tests {
         assert!(s.contains("203.0.113.7:443"), "{s}");
         assert!(s.contains("connect"), "{s}");
         assert!(s.contains("cargo buildclamp explain evil"), "{s}");
+    }
+
+    #[test]
+    fn a_listed_destination_the_supervisor_could_not_connect_is_not_called_unlisted() {
+        // EACCES: the proxy could not borrow the unit's socket. Telling the person to add
+        // an address that is already listed sends them after the wrong fix.
+        let mut u = refused_unit();
+        u.envelope.granted = CapabilitySet::of(&[Capability::Net]);
+        u.envelope.net_destinations = vec!["203.0.113.7:443".into()];
+        u.tiers.insert(
+            Capability::Net.into(),
+            Tier::Enforced {
+                mechanism: "netns+connect-proxy".into(),
+            },
+        );
+        u.requests[0].outcome = Outcome::Ungranted { errno: 13 };
+        let s = refusal_line(&u);
+        assert!(s.contains("The list is not the problem"), "{s}");
+        assert!(!s.contains("is not one of them"), "{s}");
+        u.requests[0].outcome = Outcome::Ungranted { errno: 1 };
+        assert!(refusal_line(&u).contains("is not one of them"));
     }
 
     #[test]
@@ -1035,12 +1175,17 @@ mod tests {
     }
 
     #[test]
-    fn explain_says_out_loud_that_destinations_are_not_enforced() {
-        // Shipping an advisory field that reads as enforcement is the exact trap this
-        // project exists to avoid, so the word appears wherever the field does.
+    fn explain_says_what_a_destination_list_holds_and_what_it_does_not() {
+        // Enforced since 0.2, and the scope of that is said where the field is shown: TCP to
+        // these only, names resolved at start. Overclaiming it would be the old trap
+        // reversed.
         let mut e = Envelope::build_script_default();
         e.net_destinations = vec!["crates.io:443".into()];
         let s = explain("fetcher", None, &e, &[]);
-        assert!(s.contains("does NOT enforce"), "{s}");
+        assert!(s.contains("reaches    crates.io:443"), "{s}");
+        assert!(
+            s.contains("enforced: TCP to the addresses these resolved to"),
+            "{s}"
+        );
     }
 }

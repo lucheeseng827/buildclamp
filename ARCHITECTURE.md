@@ -224,10 +224,10 @@ applied**.
 
 | capability | preferred | fallback | last resort |
 |---|---|---|---|
-| network | `enforced:netns` — an empty network namespace | `enforced:seccomp-errno` — `socket(AF_INET…)` returns `EPERM` | `none` |
+| network | `enforced:netns` — an empty network namespace; with a grant's `net-destinations`, `enforced:netns+connect-proxy` — the supervisor makes each listed TCP connection and hands over the socket | `enforced:seccomp-errno` — `socket(AF_INET…)` returns `EPERM` | `none` |
 | filesystem | `enforced:landlock-vN` — a per-path ruleset the unit applies to itself | `enforced:mountns-ro` — read-only root, writable binds | `advisory:seccomp-notify` |
 | environment | `enforced:scrub+userns` — scrubbed, plus a child user namespace, which fails `ptrace_may_access` against the parent's, so `/proc/<pid>/environ` is `EPERM` | `advisory:scrub` — scrubbed, but a same-uid process's environ is still readable | `advisory:scrub` |
-| exec | `enforced:seccomp-notify-record` — recorded, never refused | `enforced:seccomp-notify-record` | `none` — without seccomp notification exec cannot even be recorded |
+| exec | `enforced:landlock-vN` — write xor execute: nothing the unit can write may be `execve`d, except from a grant's `exec-zones`; with user namespaces the writable binds are also mounted `noexec`, which stops the loader mapping one | `enforced:mountns-noexec` — no Landlock, but the noexec binds refuse `execve` and `mmap(PROT_EXEC)` alike; then `advisory:seccomp-notify` — a refused exec never runs, but an allowed one is a CONTINUE the unit can race | `none` |
 
 That row used to say `enforced:pidns`, and it was crediting the wrong namespace. Unshare
 each flag on its own and attempt the read: with `CLONE_NEWPID` the environment of a
@@ -377,10 +377,11 @@ properties follow, and both are tested:
   unimplemented compiler-team MCP #475 prefers. It is a rewrite, not a wrapper, and the
   `-Zsandbox` experiment that tried it stalled on a real problem: `wasm32-wasip1` has no
   process spawning, and build scripts must spawn `pkg-config` and C compilers.
-* **An enforced network destination allowlist.** It needs a proxy or firewall rules inside
-  the namespace. The field exists, is recorded, and says everywhere it appears that it is
-  not enforced.
-* **Read restrictions.** Reads are unrestricted by default; a read-deny list for `~/.ssh`,
-  `~/.aws` and browser profiles is the most valuable single addition and is not in v0.
+* **A destination allowlist by name.** Since 0.2 `net-destinations` is enforced, but by
+  the addresses the names resolved to when the unit started, so a shared CDN address
+  admits every site on it. Holding a name would need TLS-aware proxying.
+* **Reads restricted by default.** Reads are unrestricted unless the policy opts in, with
+  `withhold-secret-reads` (a deny list) or, since 0.2, `read-allowlist` (an allow list);
+  both need Landlock.
 * **Static reachability analysis.** `cargo-acl` does this well and buildclamp does not do
   it at all. They compose.

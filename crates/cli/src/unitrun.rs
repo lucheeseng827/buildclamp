@@ -207,11 +207,17 @@ pub fn launch(ctx: LaunchContext, real: &std::path::Path, args: &[std::ffi::OsSt
         command.current_dir(dir);
     }
 
+    let dests = destinations(&envelope);
     let plan = Plan {
-        allow_net: envelope.permits(Capability::Net),
+        allow_net: dests.allow_net,
         allow_unix: envelope.permits(Capability::Unix),
         writable: paths.writable.clone(),
         withheld_reads: withheld_reads(&policy, &envelope),
+        read_allowed: read_allowed(
+            &envelope,
+            ctx.manifest_dir.as_deref(),
+            ctx.out_dir.as_deref().and_then(profile_dir_of).as_deref(),
+        ),
         private_tmp: paths.private_tmp.clone(),
         env: kept,
         // `observe --deep`. Without it, writes are notified only when there is no
@@ -223,10 +229,20 @@ pub fn launch(ctx: LaunchContext, real: &std::path::Path, args: &[std::ffi::OsSt
         observe_only: mode == Mode::Observe,
         proc_macro_objects: Vec::new(),
         skip_exec_target: Some(real.to_path_buf()),
+        // Write xor execute: nothing the unit can write may be run, except from the zones
+        // its grant named in `exec-zones`. A grant without `exec` refuses every exec.
+        deny_exec: !envelope.permits(Capability::Exec),
+        no_exec: paths.writable.clone(),
+        exec_allowed: buildclamp_shim::resolve_exec_zones(&envelope, &unit_ctx),
+        // A build script loads nothing it wrote: no exemption from the noexec mount.
+        load_allowed: Vec::new(),
+        net_allowed: dests.allowed,
+        hosts: dests.hosts,
     };
 
     let started = std::time::Instant::now();
-    let held = match plan.hold(command) {
+    let held = plan.hold(command);
+    let held = match held {
         Ok(h) => h,
         Err(e) => {
             // Refusing to run rather than running unheld. This is the property that
@@ -292,7 +308,13 @@ pub(crate) fn withheld_reads(
     policy: &buildclamp_core::Policy,
     envelope: &buildclamp_core::Envelope,
 ) -> Vec<std::path::PathBuf> {
-    if !policy.defaults.withhold_secret_reads || envelope.permits(Capability::FsRead) {
+    // The read allowlist withholds these too: a `read-paths` entry over part of the home
+    // directory can contain one, and an allowlist that handed it back would be weaker than
+    // the deny-list it is meant to improve on. These are home-relative paths: a credential
+    // file inside the workspace is not among them, and the README says so.
+    if !(policy.defaults.withhold_secret_reads || envelope.read_allowlist)
+        || envelope.permits(Capability::FsRead)
+    {
         return Vec::new();
     }
     let Some(home) = std::env::var_os("HOME") else {
@@ -305,6 +327,155 @@ pub(crate) fn withheld_reads(
         .into_iter()
         .map(|(p, _)| p)
         .collect()
+}
+
+/// The roots a unit may read beneath under `read-allowlist`, or none when it is off or the
+/// unit's grant lists `fs-read` (which reads everything).
+///
+/// `profile_dir` is the target profile directory (`target/debug`): build scripts read the
+/// `OUT_DIR`s of the crates they depend on (`DEP_*_INCLUDE`), and rustc reads `deps/`.
+/// Writable zones need no entry here — a write zone is readable by construction.
+pub(crate) fn read_allowed(
+    envelope: &buildclamp_core::Envelope,
+    manifest_dir: Option<&std::path::Path>,
+    profile_dir: Option<&std::path::Path>,
+) -> Vec<std::path::PathBuf> {
+    use std::path::PathBuf;
+    if !envelope.read_allowlist || envelope.permits(Capability::FsRead) {
+        return Vec::new();
+    }
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let mut roots: Vec<PathBuf> = [
+        "/usr",
+        "/lib",
+        "/lib32",
+        "/lib64",
+        "/libx32",
+        "/bin",
+        "/sbin",
+        "/etc",
+        "/proc",
+        "/sys",
+        "/dev",
+        "/nix/store",
+    ]
+    .iter()
+    .map(PathBuf::from)
+    .collect();
+    // The cargo home's dependency sources and binaries, never the cargo home itself: it
+    // holds `credentials.toml`, the token that publishes as you.
+    let cargo_home = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|h| h.join(".cargo")));
+    if let Some(c) = cargo_home {
+        roots.extend(["registry", "git", "bin"].iter().map(|s| c.join(s)));
+    }
+    roots.extend(
+        std::env::var_os("RUSTUP_HOME")
+            .map(PathBuf::from)
+            .or_else(|| home.as_ref().map(|h| h.join(".rustup"))),
+    );
+    roots.extend(crate::driver::workspace_member_dirs_from_env());
+    roots.extend(manifest_dir.map(std::path::Path::to_path_buf));
+    roots.extend(profile_dir.map(std::path::Path::to_path_buf));
+    for p in &envelope.read_paths {
+        match (p.strip_prefix("~/"), &home) {
+            (Some(rest), Some(h)) => roots.push(h.join(rest)),
+            (Some(_), None) => {} // no home to resolve against: grant nothing, fail closed
+            (None, _) => roots.push(PathBuf::from(p)),
+        }
+    }
+    roots
+}
+
+/// The target profile directory an `OUT_DIR` sits in: the parent of its `build` ancestor,
+/// in both cargo layouts (`build/<pkg>-<hash>/out` and, from 1.100, `build/<pkg>/<hash>/out`).
+pub(crate) fn profile_dir_of(out_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    // `build` sits at a fixed depth in each layout, told apart by whether the unit directory
+    // is a bare 16-hex hash. Searching upward for the first `build` would stop at a package
+    // that is itself named `build` (`build/build/<hash>/out`).
+    if out_dir.file_name()? != "out" {
+        return None;
+    }
+    let unit = out_dir.parent()?;
+    let bare_hash = unit
+        .file_name()?
+        .to_str()
+        .is_some_and(|n| n.len() == 16 && n.bytes().all(|b| b.is_ascii_hexdigit()));
+    let build = if bare_hash {
+        unit.parent()?.parent()?
+    } else {
+        unit.parent()?
+    };
+    if build.file_name()? != "build" {
+        return None;
+    }
+    build.parent().map(std::path::Path::to_path_buf)
+}
+
+/// What a grant's `net-destinations` becomes for the sandbox.
+pub(crate) struct Destinations {
+    /// May the unit have the whole network? False when it has a destination list.
+    pub allow_net: bool,
+    /// The resolved addresses the supervisor may connect to for it.
+    pub allowed: Vec<std::net::SocketAddr>,
+    /// The hosts file contents that make the listed names resolve inside the namespace.
+    pub hosts: Option<String>,
+}
+
+/// Resolve a grant's `net-destinations` here, on the host's network, at the moment the unit
+/// starts: the unit's own namespace has no resolver, and a name resolved now is not a CDN
+/// address written into a policy months ago.
+///
+/// `net` without destinations is the whole network, as it always was. `net` with them is
+/// those destinations and nothing else. A destination that does not resolve is reported and
+/// left out, which fails closed: connections to it are refused.
+pub(crate) fn destinations(envelope: &buildclamp_core::Envelope) -> Destinations {
+    use std::net::{SocketAddr, ToSocketAddrs};
+    let allow_net = envelope.permits(Capability::Net);
+    if !allow_net || envelope.net_destinations.is_empty() {
+        return Destinations {
+            allow_net,
+            allowed: Vec::new(),
+            hosts: None,
+        };
+    }
+    let mut allowed: Vec<SocketAddr> = Vec::new();
+    // Only the listed names, at the addresses they resolved to here, and the loopback name.
+    // A name the unit could resolve to an address it may not reach would only turn its first
+    // connection attempt into a refusal.
+    let mut hosts = String::from("127.0.0.1 localhost\n");
+    for d in &envelope.net_destinations {
+        if let Ok(a) = d.parse::<SocketAddr>() {
+            allowed.push(a);
+            continue;
+        }
+        let resolved: Vec<SocketAddr> = d
+            .rsplit_once(':')
+            .and_then(|(h, p)| Some((h, p.parse::<u16>().ok()?)))
+            .and_then(|hp| hp.to_socket_addrs().ok())
+            .map(Iterator::collect)
+            .unwrap_or_default();
+        if resolved.is_empty() {
+            eprintln!(
+                "buildclamp: net-destination `{d}` did not resolve; connections to it will be refused"
+            );
+            continue;
+        }
+        let host = d.rsplit_once(':').map(|(h, _)| h).unwrap_or(d);
+        for a in &resolved {
+            hosts.push_str(&format!("{} {host}\n", a.ip()));
+        }
+        allowed.extend(resolved);
+    }
+    allowed.sort();
+    allowed.dedup();
+    // Contents, not a file: the sandbox makes it unnamed, out of every unit's reach.
+    Destinations {
+        allow_net: false,
+        allowed,
+        hosts: Some(hosts),
+    }
 }
 
 /// The capability set a unit actually exercised, for observe mode and drift.
@@ -321,6 +492,24 @@ fn observed_from(requests: &[buildclamp_core::Request]) -> buildclamp_core::Capa
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_profile_directory_is_found_in_both_layouts_even_for_a_package_named_build() {
+        use std::path::{Path, PathBuf};
+        for (out, want) in [
+            ("/t/debug/build/serde-1a2b3c4d5e6f7a8b/out", "/t/debug"),
+            ("/t/debug/build/serde/1a2b3c4d5e6f7a8b/out", "/t/debug"),
+            ("/t/debug/build/build/1a2b3c4d5e6f7a8b/out", "/t/debug"),
+            ("/t/release/build/build-1a2b3c4d5e6f7a8b/out", "/t/release"),
+        ] {
+            assert_eq!(
+                profile_dir_of(Path::new(out)),
+                Some(PathBuf::from(want)),
+                "{out}"
+            );
+        }
+        assert_eq!(profile_dir_of(Path::new("/t/debug/deps")), None);
+    }
 
     #[test]
     fn the_instance_discriminator_comes_from_out_dirs_parent() {

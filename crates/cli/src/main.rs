@@ -269,20 +269,42 @@ fn hold_compile(
     }
 
     let proc_macros = run.read_macros();
+    let dests = crate::unitrun::destinations(&envelope);
     let plan = buildclamp_sandbox::Plan {
-        allow_net: envelope.permits(buildclamp_core::Capability::Net),
+        allow_net: dests.allow_net,
         allow_unix: envelope.permits(buildclamp_core::Capability::Unix),
         writable: paths.writable.clone(),
         // A held compile unit is where a proc-macro runs, so `withhold-secret-reads` has to
         // reach it too — an empty list here let a held proc-macro read the withheld
         // credential paths even on a Landlock host. Same resolution as the build path.
         withheld_reads: crate::unitrun::withheld_reads(policy, &envelope),
+        read_allowed: crate::unitrun::read_allowed(
+            &envelope,
+            std::env::var_os("CARGO_MANIFEST_DIR")
+                .map(std::path::PathBuf::from)
+                .as_deref(),
+            invocation.profile_dir().as_deref(),
+        ),
         private_tmp: paths.private_tmp.clone(),
         env: kept,
         observe_writes: false,
         observe_only: policy.defaults.mode == Mode::Observe,
         proc_macro_objects: proc_macros.clone(),
         skip_exec_target: None,
+        // The same write-xor-execute rule as a build script: rustc runs the linker from
+        // the toolchain, never a file it wrote into `target`. But not the grant's "no
+        // exec at all": a grant is written for the crate's build script, and rustc has to
+        // run the linker (and, under rustup, the proxy the real rustc) whatever it says.
+        // Refusing those failed every held compile of a binary whose grant omits `exec`
+        // (`a_held_compile_links_even_when_the_crate_grant_omits_exec`).
+        deny_exec: false,
+        no_exec: paths.writable.clone(),
+        exec_allowed: buildclamp_shim::resolve_exec_zones(&envelope, &unit_ctx),
+        // rustc maps proc-macro shared objects out of `target` — a noexec mount there
+        // would refuse every macro. `execve` from it is still refused by Landlock.
+        load_allowed: invocation.profile_dir().into_iter().collect(),
+        net_allowed: dests.allowed,
+        hosts: dests.hosts,
     };
 
     // `plan.hold` consumes `cmd`, and the contract above is that a compile which cannot be
@@ -297,7 +319,8 @@ fn hold_compile(
     }
 
     let started = std::time::Instant::now();
-    let held = match plan.hold(cmd) {
+    let held = plan.hold(cmd);
+    let held = match held {
         Ok(h) => h,
         Err(e) => {
             // hold-compile-units is on, but the sandbox could not be applied to this unit.
@@ -307,11 +330,10 @@ fn hold_compile(
             // is what keeps the report honest: an omitted unit is invisible to
             // `is_fully_enforced`, which keys on the flag and would still read "fully
             // enforced" with a proc-macro having run outside the sandbox. Recording every
-            // non-observe-only capability at `Tier::None` makes the unit visible, drops its
-            // enforcement summary to `none:`, and so turns `is_fully_enforced` false and
-            // fails `--require-enforced` — the honest reading of a unit nothing held. `exec`
-            // is left out because it is observe-only: it is advisory on every host by design,
-            // so a `none:` for it would say nothing this scan does not already know.
+            // capability at `Tier::None` makes the unit visible, drops its enforcement summary
+            // to `none:`, and so turns `is_fully_enforced` false and fails
+            // `--require-enforced` — the honest reading of a unit nothing held. Exec included:
+            // since 0.2 it is enforceable, so an unheld unit's exec is as unheld as the rest.
             eprintln!(
                 "buildclamp: could not hold this compilation ({e}); running it unheld and \
                  recording it as unheld, so the report cannot read as fully enforced"
@@ -323,7 +345,6 @@ fn hold_compile(
             let unheld_tiers: std::collections::BTreeMap<Forward<Capability>, Tier> =
                 Capability::ALL
                     .into_iter()
-                    .filter(|c| !c.is_observe_only())
                     .map(|c| {
                         (
                             Forward::Known(c),
@@ -693,12 +714,20 @@ fn selftest(a: args::SelftestArgs) -> i32 {
         allow_unix: false,
         writable: Vec::new(),
         withheld_reads: Vec::new(),
+        read_allowed: Vec::new(),
         private_tmp: None,
         env: kept,
         observe_writes: false,
         observe_only: false,
         proc_macro_objects: Vec::new(),
         skip_exec_target: None,
+        // A network self-check: it writes nowhere, so there is nothing to keep from running.
+        deny_exec: false,
+        no_exec: Vec::new(),
+        exec_allowed: Vec::new(),
+        load_allowed: Vec::new(),
+        net_allowed: Vec::new(),
+        hosts: None,
     };
 
     // The command keeps its own stdout rather than having it captured, so a user-supplied

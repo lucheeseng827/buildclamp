@@ -30,8 +30,12 @@
 //! Anything not in `handled_access_fs` is untouched. So the handled set is exactly the
 //! write-shaped rights and nothing else:
 //!
-//! * **not `EXECUTE`** — build scripts run `cc`, `pkg-config` and `git`, exec is granted
-//!   by default, and handling it would deny every one of them outside a write zone.
+//! * **`EXECUTE` only when the plan restricts exec** — see [`ExecRule`]. Write xor execute:
+//!   the ruleset grants `EXECUTE` beneath everything *except* the unit's writable
+//!   directories, by the same complement walk [`read_roots`] does for withheld reads, so
+//!   `cc`, `pkg-config` and `git` still run and a program the unit wrote does not. Write
+//!   zones are therefore granted the handled mask *without* `EXECUTE`; granting them the
+//!   whole mask would make every write zone executable and the rule a no-op.
 //! * **`READ_FILE` / `READ_DIR` only when the policy withholds something.** Reads are
 //!   unrestricted by default and the README says so. When `withhold-secret-reads` is on,
 //!   the read bits join the handled set and the ruleset grants read beneath everything
@@ -62,6 +66,9 @@ const SYS_LANDLOCK_RESTRICT_SELF: libc::c_long = 446;
 const LANDLOCK_RULE_PATH_BENEATH: libc::c_int = 1;
 
 // LANDLOCK_ACCESS_FS_*, from include/uapi/linux/landlock.h.
+/// Executing a file, ABI 1. Checked when the kernel opens a file for `execve` — the
+/// program and its ELF interpreter — and not when a shared library is mapped.
+const EXECUTE: u64 = 1 << 0;
 const WRITE_FILE: u64 = 1 << 1;
 const REMOVE_DIR: u64 = 1 << 4;
 const REMOVE_FILE: u64 = 1 << 5;
@@ -264,6 +271,57 @@ pub fn read_roots(
     out
 }
 
+/// The paths to grant beneath one allowed `root` so that everything under it **except**
+/// `withheld` is covered — [`read_roots`]'s walk, started at `root` instead of `/`.
+///
+/// For the read allowlist: an allowed root can contain a withheld path (a `read-paths`
+/// entry over part of a home directory that holds `~/.aws`), and granting the root
+/// whole would hand that path back. With nothing withheld beneath it the root itself is
+/// the one grant. A withheld path that *is* the root, or contains it, grants nothing.
+pub(crate) fn roots_within(
+    root: &Path,
+    withheld: &[std::path::PathBuf],
+    list: &dyn Fn(&Path) -> Vec<std::path::PathBuf>,
+) -> Vec<std::path::PathBuf> {
+    use std::collections::BTreeSet;
+    use std::path::PathBuf;
+    if withheld.iter().any(|w| root.starts_with(w)) {
+        return Vec::new();
+    }
+    let blocked: BTreeSet<PathBuf> = withheld
+        .iter()
+        .filter(|w| w.starts_with(root))
+        .cloned()
+        .collect();
+    if blocked.is_empty() {
+        return vec![root.to_path_buf()];
+    }
+    let mut enter: BTreeSet<PathBuf> = BTreeSet::new();
+    for b in &blocked {
+        let mut cur = b.parent();
+        while let Some(p) = cur.filter(|p| p.starts_with(root)) {
+            enter.insert(p.to_path_buf());
+            cur = p.parent();
+        }
+    }
+    let mut out = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        for child in list(&dir) {
+            if blocked.contains(&child) {
+                continue;
+            }
+            if enter.contains(&child) {
+                stack.push(child);
+            } else {
+                out.push(child);
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
 /// Read a directory's entries, or nothing if it cannot be read.
 ///
 /// An unreadable directory yields no grants, which fails closed: the build loses read
@@ -273,6 +331,76 @@ pub fn entries(dir: &Path) -> Vec<std::path::PathBuf> {
         return Vec::new();
     };
     rd.flatten().map(|e| e.path()).collect()
+}
+
+/// What the ruleset does about `execve`.
+///
+/// Nothing at all unless [`ExecRule::restricts`]: `EXECUTE` is then not handled and the
+/// kernel restricts exec in no way, which is what a plan that asked for nothing gets.
+pub struct ExecRule<'a> {
+    /// Refuse every exec except `program` itself.
+    pub deny_all: bool,
+    /// Directories nothing may be executed from. Canonical paths: a symlinked ancestor
+    /// would otherwise let the complement walk grant the real directory by its other name.
+    pub no_exec: &'a [std::path::PathBuf],
+    /// Directories inside `no_exec` that may be executed from anyway.
+    pub exec_allowed: &'a [std::path::PathBuf],
+    /// The program the held process is about to exec, which every rule must allow or the
+    /// unit could not start.
+    pub program: Option<&'a Path>,
+}
+
+impl ExecRule<'_> {
+    /// Does this rule restrict exec at all?
+    pub(crate) fn restricts(&self) -> bool {
+        self.deny_all || !self.no_exec.is_empty()
+    }
+}
+
+/// The ELF interpreter a dynamically linked program names, e.g. `/lib64/ld-linux-x86-64.so.2`.
+///
+/// Needed when exec is denied outright: the kernel opens the interpreter for execution as
+/// well as the program, so a ruleset granting only the program would refuse the program's
+/// own start. 64-bit little-endian ELF only; anything else returns `None`, the ruleset then
+/// grants the program alone, and a dynamically linked program fails to start — closed,
+/// and loudly, rather than open.
+pub(crate) fn elf_interpreter(program: &Path) -> Option<std::path::PathBuf> {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f = std::fs::File::open(program).ok()?;
+    let mut h = [0u8; 64];
+    f.read_exact(&mut h).ok()?;
+    // \x7fELF, ELFCLASS64, ELFDATA2LSB.
+    if &h[..4] != b"\x7fELF" || h[4] != 2 || h[5] != 1 {
+        return None;
+    }
+    let u16_at = |b: &[u8], o: usize| u16::from_le_bytes([b[o], b[o + 1]]) as u64;
+    let u64_at = |b: &[u8], o: usize| u64::from_le_bytes(b[o..o + 8].try_into().unwrap());
+    let (phoff, phentsize, phnum) = (u64_at(&h, 32), u16_at(&h, 54), u16_at(&h, 56));
+    if !(56..=4096).contains(&phentsize) || phnum > 4096 {
+        return None;
+    }
+    let mut ph = vec![0u8; phentsize as usize];
+    for i in 0..phnum {
+        // Checked: the header is the held program's, and a crafted one must not panic us.
+        f.seek(SeekFrom::Start(
+            phoff.checked_add(i.checked_mul(phentsize)?)?,
+        ))
+        .ok()?;
+        f.read_exact(&mut ph).ok()?;
+        // PT_INTERP = 3.
+        if u32::from_le_bytes([ph[0], ph[1], ph[2], ph[3]]) == 3 {
+            let (off, len) = (u64_at(&ph, 8), u64_at(&ph, 32));
+            if len == 0 || len > 4096 {
+                return None;
+            }
+            let mut s = vec![0u8; len as usize];
+            f.seek(SeekFrom::Start(off)).ok()?;
+            f.read_exact(&mut s).ok()?;
+            let s = s.split(|b| *b == 0).next()?;
+            return Some(std::path::PathBuf::from(std::str::from_utf8(s).ok()?));
+        }
+    }
+    None
 }
 
 /// A ruleset built in the parent, ready for the child to apply.
@@ -294,12 +422,17 @@ impl Ruleset {
         abi: i32,
         writable: &[std::path::PathBuf],
         withheld: &[std::path::PathBuf],
+        read_allowed: &[std::path::PathBuf],
+        exec: &ExecRule<'_>,
     ) -> Result<Option<Self>, i32> {
         if abi < 1 {
             return Ok(None);
         }
-        let restrict_reads = !withheld.is_empty();
-        let handled = handled_access(abi, restrict_reads);
+        let restrict_reads = !withheld.is_empty() || !read_allowed.is_empty();
+        let mut handled = handled_access(abi, restrict_reads);
+        if exec.restricts() {
+            handled |= EXECUTE;
+        }
         let attr = RulesetAttr {
             handled_access_fs: handled,
         };
@@ -332,7 +465,11 @@ impl Ruleset {
             // not fatal in `ns.rs`: the caller creates them, and one that is missing means
             // one fewer writable directory rather than a build that cannot start. It fails
             // closed — the unit simply cannot write there.
-            ruleset.allow(dir.as_path(), handled, true)?;
+            //
+            // Never `EXECUTE`: a write zone that could also be executed from is the one
+            // combination write-xor-execute exists to refuse. Exec beneath a zone a grant
+            // named in `exec-zones` is granted below, separately and on purpose.
+            ruleset.allow(dir.as_path(), handled & !EXECUTE, true)?;
         }
         // The paths every unit may write to whatever the policy says: `/dev/null` and the
         // handful of device nodes that behave like it. See `crate::ALWAYS_WRITABLE`, which
@@ -361,8 +498,30 @@ impl Ruleset {
         // already granted. Each root is granted the READ bits only: a directory the unit
         // may read is not thereby a directory it may write, and handing out the write mask
         // here would quietly widen every write zone to the whole filesystem.
+        // The read allowlist: reads only beneath the allowed roots, minus anything withheld
+        // inside them. Canonical roots, so a symlinked root is granted as what it resolves to
+        // rather than skipped by the no-follow open below.
+        // The withheld paths in both spellings: the roots are canonical, so a withheld path
+        // reached through a symlinked home would otherwise not be seen as inside its root,
+        // and the whole root — credentials included — would be granted.
+        let mut withheld_both: Vec<std::path::PathBuf> = withheld.to_vec();
+        withheld_both.extend(
+            withheld
+                .iter()
+                .filter_map(|w| std::fs::canonicalize(w).ok()),
+        );
+        let allowlisted: Vec<std::path::PathBuf> = read_allowed
+            .iter()
+            .filter_map(|r| std::fs::canonicalize(r).ok())
+            .flat_map(|r| roots_within(&r, &withheld_both, &entries))
+            .collect();
         if restrict_reads {
-            for root in read_roots(withheld, &entries) {
+            let roots = if read_allowed.is_empty() {
+                read_roots(withheld, &entries)
+            } else {
+                allowlisted
+            };
+            for root in roots {
                 // Open the root ONCE, with O_NOFOLLOW, and use that single descriptor for both
                 // the symlink/type check and the rule. A separate lstat-then-open would leave a
                 // window in which the final component could be swapped for a symlink, after
@@ -379,6 +538,48 @@ impl Ruleset {
                 let _ = ruleset.add_rule(fd, read_access(is_dir, handled));
                 // SAFETY: we opened `fd` and nothing else holds it.
                 unsafe { libc::close(fd) };
+            }
+        }
+
+        // Exec. Every grant below is `EXECUTE` alone, and every skip fails closed: one
+        // fewer place a program may run from.
+        if exec.restricts() {
+            // The program and its interpreter, in both branches — the supervisor always allows
+            // the program, and a program that happens to live under a no-exec directory (a
+            // grant writing `target`) must start on a Landlock host as it does elsewhere.
+            // `allow` opens without O_NOFOLLOW, so a symlinked `/bin/sh` or loader is keyed
+            // on the file it resolves to. An interpreter inside a no-exec directory is never
+            // granted: the unit could rewrite it and run anything as "the interpreter".
+            if let Some(p) = exec.program {
+                if let Err(e) = ruleset.allow(p, EXECUTE, false) {
+                    eprintln!(
+                        "buildclamp: could not allow {} to start under Landlock (errno {e})",
+                        p.display()
+                    );
+                }
+                if let Some(interp) = elf_interpreter(p) {
+                    let resolved = std::fs::canonicalize(&interp).unwrap_or(interp);
+                    if !exec.no_exec.iter().any(|d| resolved.starts_with(d)) {
+                        let _ = ruleset.allow(&resolved, EXECUTE, false);
+                    }
+                }
+            }
+            if !exec.deny_all {
+                // Everything except the no-exec directories: the same complement the read
+                // restriction computes, for the same reason — Landlock can only allow.
+                for root in read_roots(exec.no_exec, &entries) {
+                    let Some((fd, _)) = open_read_root_nofollow(&root) else {
+                        continue;
+                    };
+                    let _ = ruleset.add_rule(fd, EXECUTE);
+                    // SAFETY: we opened `fd` and nothing else holds it.
+                    unsafe { libc::close(fd) };
+                }
+                // Rules are additive, so a zone inside a no-exec directory — the private
+                // tmp inside `OUT_DIR` — can be re-allowed without allowing its parent.
+                for dir in exec.exec_allowed {
+                    let _ = ruleset.allow(dir.as_path(), EXECUTE, true);
+                }
             }
         }
         Ok(Some(ruleset))
@@ -791,9 +992,39 @@ mod tests {
     }
 
     #[test]
+    fn an_allowed_root_is_granted_whole_unless_something_withheld_is_inside_it() {
+        use std::path::PathBuf;
+        let fs = |d: &Path| -> Vec<PathBuf> {
+            match d.to_str().unwrap() {
+                "/w" => vec![PathBuf::from("/w/src"), PathBuf::from("/w/.netrc")],
+                _ => Vec::new(),
+            }
+        };
+        assert_eq!(
+            roots_within(Path::new("/w"), &[], &fs),
+            vec![PathBuf::from("/w")]
+        );
+        assert_eq!(
+            roots_within(Path::new("/w"), &[PathBuf::from("/w/.netrc")], &fs),
+            vec![PathBuf::from("/w/src")],
+            "the withheld file is left out and its sibling granted"
+        );
+        assert!(
+            roots_within(Path::new("/w/x"), &[PathBuf::from("/w")], &fs).is_empty(),
+            "a root inside a withheld path grants nothing"
+        );
+    }
+
+    #[test]
     fn a_kernel_without_landlock_reports_absence_rather_than_failing() {
         // abi 0 is what `probe::landlock_abi` maps ENOSYS to. Absence is not an error: the
         // caller falls back to the mount namespace and the tier says which one applied.
-        assert!(matches!(Ruleset::build(0, &[], &[]), Ok(None)));
+        let exec = ExecRule {
+            deny_all: true,
+            no_exec: &[],
+            exec_allowed: &[],
+            program: None,
+        };
+        assert!(matches!(Ruleset::build(0, &[], &[], &[], &exec), Ok(None)));
     }
 }

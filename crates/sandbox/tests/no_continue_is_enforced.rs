@@ -236,12 +236,15 @@ fn the_notify_mechanism_exists_and_is_advisory() {
         .into_iter()
         .map(|(_, a)| a)
         .collect();
+    // Changed deliberately in 0.2: exec used to be recorded and never refused
+    // (`seccomp-notify-record`). It is now refused from writable directories, enforced where
+    // Landlock's EXECUTE applies, and on a host without Landlock its rung is the advisory
+    // notification one — because an allowed exec is still a CONTINUE. Pin that row.
     assert!(
-        advisory_args
-            .iter()
-            .any(|a| a.contains("seccomp-notify-record")),
-        "no `advisory(` call names `seccomp-notify-record`; if exec stopped being recorded \
-         this test should change deliberately, not by accident"
+        advisory_args.iter().any(|a| a.contains("seccomp-notify")
+            && a.contains("an allowed one is answered with CONTINUE")),
+        "no `advisory(` call grades exec's notification rung; without Landlock an allowed exec \
+         is a CONTINUE, and that row must say so"
     );
     assert!(
         advisory_args.iter().any(|a| a.contains("seccomp-notify")),

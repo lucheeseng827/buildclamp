@@ -60,7 +60,7 @@ checksum = "b588b76d00fde79687d7646a9b5bdf3cc0f655e0bbd080335a95d7e96f3587da"
 
 [[package]]
 name = "buildclamp-core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "ring",
  "semver",
@@ -72,7 +72,7 @@ dependencies = [
 
 [[package]]
 name = "buildclamp-sandbox"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "buildclamp-core",
  "libc",
@@ -83,7 +83,7 @@ dependencies = [
 
 [[package]]
 name = "buildclamp-shim"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "buildclamp-core",
  "buildclamp-sandbox",
@@ -104,7 +104,7 @@ dependencies = [
 
 [[package]]
 name = "cargo-buildclamp"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "buildclamp-core",
  "buildclamp-sandbox",

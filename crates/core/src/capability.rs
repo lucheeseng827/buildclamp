@@ -106,25 +106,6 @@ impl Capability {
         }
     }
 
-    /// Is this a capability buildclamp records but never refuses?
-    ///
-    /// Exactly one: [`Capability::Exec`]. A build script legitimately spawns `cc`,
-    /// `pkg-config` and `git`, a spawned process inherits every namespace and the seccomp
-    /// filter, and the sandbox's decider allows every exec by construction (its
-    /// `_ => Decision::Allow` arm). So exec is *observed* — recorded on every unit so a
-    /// build that shells out to something surprising is visible — and never denied.
-    ///
-    /// It matters for the enforcement floor. `--require-enforced` and a `doctor --require`
-    /// floor ask "could this host refuse each capability atomically?", and the answer for
-    /// an observe-only capability is "buildclamp does not refuse it on any host, by
-    /// design." Counting it would make the floor unsatisfiable everywhere — an exec tier is
-    /// advisory on every host that can record at all and `none` on the rest, never
-    /// enforced — which is why the floor skips it rather than failing forever. See
-    /// `Report::exit_code` and `Floor::unmet`.
-    pub fn is_observe_only(self) -> bool {
-        matches!(self, Capability::Exec)
-    }
-
     /// One line a person can act on, used in `explain` output and in the single stderr
     /// line cargo shows when a unit is refused.
     pub fn describe(self) -> &'static str {

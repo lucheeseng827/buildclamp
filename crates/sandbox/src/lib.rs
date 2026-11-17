@@ -86,6 +86,12 @@ pub struct Plan {
     /// deliberately does not — this is a deny-list and the documentation must not let it
     /// be read as an allow-list.
     pub withheld_reads: Vec<PathBuf>,
+    /// The only directories the unit may read beneath, besides the ones it may write.
+    ///
+    /// Empty — the default — means no read allowlist: reads are restricted only by
+    /// `withheld_reads`, or not at all. Non-empty means everything else is unreadable on a
+    /// Landlock host, and `withheld_reads` still applies inside these roots.
+    pub read_allowed: Vec<PathBuf>,
     /// A private directory to expose as `TMPDIR`.
     pub private_tmp: Option<PathBuf>,
     /// The environment the unit will see. Already scrubbed by the caller: this crate does
@@ -112,6 +118,38 @@ pub struct Plan {
     /// blindly means a build script that genuinely re-executes that same binary is still
     /// recorded on its second attempt.
     pub skip_exec_target: Option<PathBuf>,
+    /// Refuse every `execve` except the one that starts the held command itself.
+    ///
+    /// `false` by default, so `Plan { allow_net: true, ..Default::default() }` keeps the
+    /// behaviour it always had: exec is not restricted.
+    pub deny_exec: bool,
+    /// Directories beneath which nothing may be executed.
+    ///
+    /// Write xor execute: a caller that passes its writable zones here stops a unit from
+    /// writing a program and then running it. It does not stop `sh written.sh`, because an
+    /// interpreter reading a script is a read, not an exec. Empty by default, which
+    /// restricts nothing.
+    pub no_exec: Vec<PathBuf>,
+    /// Directories inside `no_exec` that may be executed from anyway: the zones a grant
+    /// named in `exec-zones`, for the crates that build a program and then run it.
+    pub exec_allowed: Vec<PathBuf>,
+    /// Directories inside `no_exec` whose files may still be *mapped* executable, though not
+    /// `execve`d: where rustc loads proc-macro shared objects from. They are left off the
+    /// `noexec` mount, which would refuse the load; Landlock's EXECUTE rule, which governs
+    /// `execve` only, still applies to them.
+    pub load_allowed: Vec<PathBuf>,
+    /// The only addresses the unit may connect to, when it may not have the network.
+    ///
+    /// Empty — the default — means `allow_net` decides alone. Non-empty, with `allow_net`
+    /// false, the unit stays in an empty network namespace and the supervisor makes each
+    /// allowed TCP connection itself and hands the unit the connected socket; anything else
+    /// is refused. Resolved by the caller: this crate does not do DNS.
+    pub net_allowed: Vec<std::net::SocketAddr>,
+    /// The contents of a hosts file to mount over `/etc/hosts`, so the names behind
+    /// `net_allowed` resolve inside a namespace that has no route to a resolver. Contents,
+    /// not a path: the file is made here as an unnamed temporary, so no other unit can swap,
+    /// rewrite or read it before it is mounted.
+    pub hosts: Option<String>,
 }
 
 impl Plan {
@@ -120,13 +158,27 @@ impl Plan {
     /// Built from the plan rather than passed in, so there is exactly one place where a
     /// capability turns into an allow or a refusal and no caller can supply a laxer one.
     #[cfg(target_os = "linux")]
-    pub(crate) fn decider(&self) -> Box<dyn crate::linux::seccomp::Decider> {
+    pub(crate) fn decider(
+        &self,
+        program: Option<PathBuf>,
+        net_allowed: Vec<std::net::SocketAddr>,
+    ) -> Box<dyn crate::linux::seccomp::Decider> {
         Box::new(PlanDecider {
             allow_net: self.allow_net,
             allow_unix: self.allow_unix,
             observe_only: self.observe_only,
             writable: self.writable.clone(),
+            deny_exec: self.deny_exec,
+            no_exec: self.no_exec.clone(),
+            exec_allowed: self.exec_allowed.clone(),
+            program,
+            net_allowed,
         })
+    }
+
+    /// Does this plan restrict exec at all?
+    pub(crate) fn restricts_exec(&self) -> bool {
+        self.deny_exec || !self.no_exec.is_empty()
     }
 }
 
@@ -138,13 +190,49 @@ struct PlanDecider {
     allow_unix: bool,
     observe_only: bool,
     writable: Vec<PathBuf>,
+    deny_exec: bool,
+    no_exec: Vec<PathBuf>,
+    exec_allowed: Vec<PathBuf>,
+    /// Addresses whose connect the supervisor performs itself. Empty unless the unit is in
+    /// an empty network namespace: without one an unconnected UDP send is invisible to the
+    /// supervisor, so allowing sockets at all would allow the network.
+    net_allowed: Vec<std::net::SocketAddr>,
+    /// The held command's own program, which every exec rule allows: refusing it would
+    /// refuse the unit, not something the unit did.
+    program: Option<PathBuf>,
 }
 
 #[cfg(target_os = "linux")]
 impl crate::linux::seccomp::Decider for PlanDecider {
+    fn destination_mode(&self) -> bool {
+        // `net_allowed` is non-empty only in destination mode, or in observe mode for a unit
+        // whose grant lists destinations — where the unit is on the real network but
+        // nothing is refused, so the datagram exception only changes what is recorded.
+        !self.net_allowed.is_empty()
+    }
+
     fn decide(&self, cap: Capability, target: &str) -> crate::linux::seccomp::Decision {
         use crate::linux::seccomp::Decision;
         let verdict = match cap {
+            // A destination list: creating an inet socket reaches nothing in an empty
+            // namespace, a connect to a listed address is made by the supervisor, and
+            // every other connect is refused.
+            Capability::Net if !self.allow_net && !self.net_allowed.is_empty() => {
+                // Families the empty namespace contains: inet, and netlink, which glibc's
+                // getaddrinfo opens to see which families exist (here, only `lo`). Packet
+                // sockets, vsock — not namespaced at all — and anything unknown stay refused.
+                if matches!(
+                    target,
+                    "AF_INET socket" | "AF_INET6 socket" | "AF_NETLINK socket"
+                ) {
+                    Decision::Allow
+                } else {
+                    match target.parse::<std::net::SocketAddr>() {
+                        Ok(a) if self.net_allowed.contains(&a) => Decision::Proxy(a),
+                        _ => Decision::Deny(libc::EPERM),
+                    }
+                }
+            }
             Capability::Net if !self.allow_net => Decision::Deny(libc::EPERM),
             Capability::Unix if !self.allow_unix => Decision::Deny(libc::EPERM),
             Capability::FsWrite => {
@@ -158,9 +246,27 @@ impl crate::linux::seccomp::Decider for PlanDecider {
                     Decision::Deny(libc::EACCES)
                 }
             }
-            // Exec is recorded, not refused: `cc`, `pkg-config` and `git` are the ordinary
-            // business of build scripts, and a spawned process inherits every namespace and
-            // the seccomp filter, so it is held exactly as tightly as its parent.
+            // A refusal here is authoritative — the syscall never runs — but an Allow is not:
+            // the kernel re-reads the path after we answer, so a unit could show us an
+            // allowed path and exec another. Landlock's EXECUTE right is what closes that,
+            // and the tier is only `enforced` where it applied. This answer is what puts the
+            // refusal in the report.
+            Capability::Exec => {
+                let is_program = self
+                    .program
+                    .as_deref()
+                    .is_some_and(|p| p.as_os_str() == target);
+                if is_program {
+                    Decision::Allow
+                } else if self.deny_exec
+                    || (self.no_exec.iter().any(|d| path_is_within(target, d))
+                        && !self.exec_allowed.iter().any(|d| path_is_within(target, d)))
+                {
+                    Decision::Deny(libc::EACCES)
+                } else {
+                    Decision::Allow
+                }
+            }
             _ => Decision::Allow,
         };
 
@@ -171,6 +277,9 @@ impl crate::linux::seccomp::Decider for PlanDecider {
         if self.observe_only {
             return match verdict {
                 Decision::Deny(_) => Decision::AllowButWouldRefuse,
+                // Observe runs on the real network with no namespace: the unit's own
+                // connect is what should happen, recorded as granted.
+                Decision::Proxy(_) => Decision::Allow,
                 other => other,
             };
         }
@@ -279,10 +388,21 @@ pub fn projected_tiers(
     // exists to make impossible to miss.
     let off = crate::linux::Disabled::from_env();
     crate::linux::plan_tiers(
-        &Plan::default(),
+        // The default envelope's shape for exec: allowed, but never from a writable
+        // directory. Projecting deny-all instead skipped the `mountns-noexec` rung, so on a
+        // host with user namespaces but no Landlock `doctor` said advisory while every real
+        // build was enforced. The path only has to be non-empty; nothing is mounted.
+        &Plan {
+            no_exec: vec![PathBuf::from("/")],
+            ..Plan::default()
+        },
         host.user_namespaces && !off.ns,
         host.seccomp_user_notif && !off.notify,
         host.landlock_abi.map(|abi| format!("landlock-v{abi}")),
+        // A build script never lives in a zone it can write; the projection is the default.
+        false,
+        // The default envelope has no destination list.
+        false,
     )
 }
 
@@ -439,6 +559,31 @@ mod always_writable_tests {
             allow_unix: true,
             observe_only: false,
             writable: writable.iter().map(PathBuf::from).collect(),
+            deny_exec: false,
+            no_exec: Vec::new(),
+            exec_allowed: Vec::new(),
+            program: None,
+            net_allowed: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn a_destination_list_lets_only_inet_sockets_be_created() {
+        // vsock is not network-namespaced at all and packet sockets reach raw frames; the
+        // list must not open them. Netlink is namespaced and glibc needs it to resolve.
+        let mut d = decider(&["/tmp/out"]);
+        d.net_allowed = vec!["127.0.0.1:443".parse().unwrap()];
+        for ok in ["AF_INET socket", "AF_INET6 socket", "AF_NETLINK socket"] {
+            assert!(
+                matches!(d.decide(Capability::Net, ok), Decision::Allow),
+                "{ok}"
+            );
+        }
+        for refused in ["AF_PACKET socket", "unknown-family socket"] {
+            assert!(
+                matches!(d.decide(Capability::Net, refused), Decision::Deny(_)),
+                "{refused}"
+            );
         }
     }
 

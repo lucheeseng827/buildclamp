@@ -34,7 +34,12 @@ const SYS_MOUNT_SETATTR: libc::c_long = 442;
 
 const OPEN_TREE_CLONE: libc::c_uint = 1;
 const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 0x0000_0004;
+/// Follow a symlink at the target: `/etc/hosts` is one on NixOS and in some images.
+const MOVE_MOUNT_T_SYMLINKS: libc::c_uint = 0x0000_0010;
 const MOUNT_ATTR_RDONLY: u64 = 0x0000_0001;
+/// Nothing on the mount may be executed — and, the half that matters, nothing on it may be
+/// mapped `PROT_EXEC`, which is what stops `ld.so ./written`.
+const MOUNT_ATTR_NOEXEC: u64 = 0x0000_0008;
 
 /// `struct mount_attr` from `<linux/mount.h>`. Not in libc 0.2.
 #[repr(C)]
@@ -84,6 +89,21 @@ pub struct Prepared {
     pub read_only_root: bool,
     /// Directories to re-attach writable, in the order they should be attached.
     pub writable: Vec<CString>,
+    /// Per `writable` entry: re-attach it `noexec`. Write xor execute, enforced by the mount
+    /// rather than by a rule about paths: `execve` of a file on it fails, and so does the
+    /// loader's `mmap(PROT_EXEC)` of one, which Landlock's EXECUTE right does not see.
+    noexec: Vec<bool>,
+    /// The writable directories as paths, for `with_noexec` to judge — kept beside the
+    /// C strings rather than passed in again, so the flags cannot be computed against a
+    /// different list from the one that is mounted.
+    writable_paths: Vec<std::path::PathBuf>,
+    /// A file to mount, read-only, over `/etc/hosts`: the names behind a destination list,
+    /// resolved by the caller, because the namespace has no route to a resolver.
+    hosts: Option<CString>,
+    /// The order to re-attach `writable` in: shallowest first, so a zone nested inside
+    /// another (the private tmp inside `OUT_DIR`) is mounted on top of its parent rather than
+    /// buried by it.
+    attach_order: Vec<usize>,
     /// The cwd to restore after `pivot_root`, which does not do it for us.
     pub cwd: Option<CString>,
     /// `<uid> <uid> 1\n`, formatted in the parent.
@@ -120,6 +140,14 @@ impl Prepared {
                 .iter()
                 .map(|p| to_c(p))
                 .collect::<io::Result<_>>()?,
+            noexec: vec![false; writable.len()],
+            writable_paths: writable.to_vec(),
+            hosts: None,
+            attach_order: {
+                let mut o: Vec<usize> = (0..writable.len()).collect();
+                o.sort_by_key(|&i| writable[i].components().count());
+                o
+            },
             cwd: match cwd {
                 Some(p) => Some(to_c(p)?),
                 None => None,
@@ -128,6 +156,68 @@ impl Prepared {
             gid_map: format!("{gid} {gid} 1\n").into_bytes(),
             scratch: CString::new("/tmp/.buildclamp-root").expect("no NUL in a literal"),
         })
+    }
+
+    /// Mark each writable directory `noexec` that lies in `no_exec` and in no `exec_allowed`
+    /// — the same rule the Landlock ruleset and the supervisor apply, by a third mechanism.
+    ///
+    /// `load_allowed` is checked both ways round, and `exec_allowed` is not. A mount flag
+    /// covers the whole bind, so a bind that merely *contains* a load-allowed directory
+    /// (`target` containing `target/debug/deps`) must stay mappable or rustc cannot load
+    /// proc-macros from it. An exec zone inside a bind (the private tmp inside `OUT_DIR`) is
+    /// its own bind, attached on top, so its parent stays `noexec`.
+    ///
+    /// The bind holding `program` is never `noexec`: the child's own final `execve` is of
+    /// that file, and a mount flag cannot exempt one file. Landlock still refuses any other
+    /// `execve` from that directory; the caller labels the tier knowing this.
+    pub fn with_noexec(
+        mut self,
+        no_exec: &[std::path::PathBuf],
+        exec_allowed: &[std::path::PathBuf],
+        load_allowed: &[std::path::PathBuf],
+        program: Option<&Path>,
+    ) -> Self {
+        for (flag, w) in self.noexec.iter_mut().zip(&self.writable_paths) {
+            *flag = no_exec.iter().any(|d| w.starts_with(d))
+                && !exec_allowed.iter().any(|a| w.starts_with(a))
+                && !load_allowed
+                    .iter()
+                    .any(|a| w.starts_with(a) || a.starts_with(w))
+                && !program.is_some_and(|p| p.starts_with(w));
+        }
+        self
+    }
+
+    /// Mount `hosts` over `/etc/hosts` in the unit's view. `None` leaves it alone. The path
+    /// is resolved again in the child, so it must be somewhere no unit can write.
+    pub fn with_hosts_file(mut self, hosts: Option<&Path>) -> io::Result<Self> {
+        self.hosts =
+            match hosts {
+                Some(p) => Some(CString::new(p.as_os_str().as_bytes()).map_err(|_| {
+                    io::Error::new(io::ErrorKind::InvalidInput, "path contains a NUL")
+                })?),
+                None => None,
+            };
+        Ok(self)
+    }
+
+    /// Whether every writable directory the rule says is no-exec really is mounted `noexec`.
+    ///
+    /// False when an exemption — the program's own bind, a load-allowed bind — left one
+    /// executable. The exec tier asks this rather than re-deriving it, so the label and the
+    /// mounts are computed from the same flags.
+    pub(crate) fn every_no_exec_bind_is_noexec(
+        &self,
+        no_exec: &[std::path::PathBuf],
+        exec_allowed: &[std::path::PathBuf],
+    ) -> bool {
+        self.writable_paths
+            .iter()
+            .zip(&self.noexec)
+            .all(|(w, &flag)| {
+                flag || !no_exec.iter().any(|d| w.starts_with(d))
+                    || exec_allowed.iter().any(|a| w.starts_with(a))
+            })
     }
 
     /// Everything the child does between `fork` and `execve`.
@@ -271,6 +361,61 @@ impl Prepared {
             // than running with one fewer writable directory. The report shows what was
             // granted, so a puzzled user can see it.
         }
+        // Write xor execute on the clones, before they are attached. A failure fails the
+        // unit: the tier is computed before the fork and may already say `mountns-noexec`,
+        // and running on with an executable `OUT_DIR` would make that label a lie.
+        let noexec = MountAttr {
+            attr_set: MOUNT_ATTR_NOEXEC,
+            ..Default::default()
+        };
+        for (fd, off) in rw_fds.iter().zip(self.noexec.iter()).take(n) {
+            if *fd >= 0
+                && *off
+                && libc::syscall(
+                    SYS_MOUNT_SETATTR,
+                    *fd,
+                    c"".as_ptr(),
+                    (libc::AT_EMPTY_PATH | libc::AT_RECURSIVE) as libc::c_uint,
+                    &noexec as *const MountAttr,
+                    std::mem::size_of::<MountAttr>(),
+                ) != 0
+            {
+                return Err(errno());
+            }
+        }
+
+        // The hosts file, cloned while the old tree is still reachable, read-only so the unit
+        // cannot rewrite its own name resolution.
+        let hosts_fd = match &self.hosts {
+            Some(h) => {
+                let fd = libc::syscall(
+                    SYS_OPEN_TREE,
+                    libc::AT_FDCWD,
+                    h.as_ptr(),
+                    OPEN_TREE_CLONE | libc::O_CLOEXEC as libc::c_uint,
+                ) as i32;
+                if fd < 0 {
+                    return Err(errno());
+                }
+                let ro = MountAttr {
+                    attr_set: MOUNT_ATTR_RDONLY,
+                    ..Default::default()
+                };
+                if libc::syscall(
+                    SYS_MOUNT_SETATTR,
+                    fd,
+                    c"".as_ptr(),
+                    libc::AT_EMPTY_PATH as libc::c_uint,
+                    &ro as *const MountAttr,
+                    std::mem::size_of::<MountAttr>(),
+                ) != 0
+                {
+                    return Err(errno());
+                }
+                fd
+            }
+            None => -1,
+        };
 
         let root_fd = libc::syscall(
             SYS_OPEN_TREE,
@@ -351,8 +496,9 @@ impl Prepared {
             return Err(errno());
         }
 
-        // Re-attach the writable directories on top of the read-only tree.
-        for (fd, dir) in rw_fds.iter().zip(self.writable.iter()).take(n) {
+        // Re-attach the writable directories on top of the read-only tree, shallowest first.
+        for &i in self.attach_order.iter().filter(|&&i| i < n) {
+            let (fd, dir) = (&rw_fds[i], &self.writable[i]);
             if *fd < 0 {
                 continue;
             }
@@ -366,6 +512,24 @@ impl Prepared {
                 MOVE_MOUNT_F_EMPTY_PATH,
             );
             libc::close(*fd);
+        }
+
+        // Fails the unit rather than running it with names that silently do not resolve.
+        if hosts_fd >= 0 {
+            let rc = libc::syscall(
+                SYS_MOVE_MOUNT,
+                hosts_fd,
+                empty,
+                libc::AT_FDCWD,
+                c"/etc/hosts".as_ptr(),
+                MOVE_MOUNT_F_EMPTY_PATH | MOVE_MOUNT_T_SYMLINKS,
+            );
+            // Read before `close`, which could overwrite it.
+            let e = errno();
+            libc::close(hosts_fd);
+            if rc != 0 {
+                return Err(e);
+            }
         }
         Ok(())
     }

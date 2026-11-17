@@ -62,10 +62,10 @@ capabilities = ["fs-write", "exec", "unix"]
 write-zones = ["out-dir", "tmp"]
 why = "detects whether the compiler exposes the unstable proc_macro span API"
 
-# A network entry, spelled out because it is the one shape that needs care. Destinations
-# are RECORDED and never enforced, so listing one here is not a promise the tool can keep
-# — it is a statement that this crate reaching this host at build time is expected. A
-# grant naming any other destination is not accepted.
+# A network entry, spelled out because it is the one shape that needs care. Since 0.2 a
+# grant's destination list is enforced (TCP only), so listing one here is what this crate
+# may reach at build time and nothing else. A grant naming any other destination is not
+# accepted.
 #
 # [[crate]]
 # name = "some-vendored-sys"

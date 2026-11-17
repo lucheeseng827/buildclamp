@@ -425,16 +425,37 @@ impl UnitRecord {
 
     /// Was any capability of this unit constrained only advisorily?
     pub fn has_advisory_tier(&self) -> bool {
-        self.tiers.iter().any(|(cap, tier)| {
-            // An observe-only capability (exec) is advisory on every host that can record
-            // at all — it is recorded, never refused, by design. Counting it here would
-            // make `--require-enforced` fail on every host forever, which is not a false
-            // assurance being caught, it is a floor being unsatisfiable. A capability this
-            // build does not recognise is NOT skipped: an unknown name might well be one a
-            // newer buildclamp does refuse, and treating it as observe-only would be the
-            // permissive guess.
-            let observe_only = cap.copied().is_some_and(Capability::is_observe_only);
-            !observe_only && matches!(tier, Tier::Advisory { .. })
+        // Every capability counts, exec included. Until 0.2 exec was skipped here as
+        // observe-only; it is refused from writable directories now, and where that refusal
+        // is only advisory the gate has to say so.
+        //
+        // Except the record a 0.1 run wrote: `exec` at `advisory:seccomp-notify-record` was
+        // the observe-only tier of its day, excluded by the reader that wrote it. An archived
+        // report or attestation must read the way it did when it was made, so that one
+        // mechanism keeps its exemption — no 0.2 run produces it.
+        self.tiers.iter().any(|(cap, tier)| match tier {
+            Tier::Advisory { mechanism, .. } => {
+                !(cap.copied() == Some(Capability::Exec) && mechanism == "seccomp-notify-record")
+            }
+            _ => false,
+        })
+    }
+
+    /// The write zone an exec target of this unit lies in, read from its own `OUT_DIR`.
+    ///
+    /// `instance` is the basename of `OUT_DIR`'s parent, unique per run, so a target
+    /// containing `/<instance>/out/` is in this unit's `OUT_DIR`, and one beneath
+    /// `.buildclamp-tmp/` there is in its private tmp. Anything else — no instance, a path
+    /// elsewhere — is `None`: `init` and the refusal name the zones they can and leave the
+    /// rest to be refused, rather than guess.
+    pub fn exec_zone_of(&self, target: &str) -> Option<crate::envelope::WriteZone> {
+        use crate::envelope::WriteZone;
+        let out = format!("/{}/out/", self.instance.as_deref()?);
+        let rest = &target[target.find(&out)? + out.len()..];
+        Some(if rest.starts_with(".buildclamp-tmp/") {
+            WriteZone::Tmp
+        } else {
+            WriteZone::OutDir
         })
     }
 
@@ -1319,6 +1340,26 @@ mod tests {
             }),
             2
         );
+    }
+
+    #[test]
+    fn a_report_written_by_0_1_reads_as_it_did_and_a_0_2_advisory_exec_does_not_pass() {
+        // 0.1 recorded exec at `advisory:seccomp-notify-record` on every unit and its reader
+        // exempted it. An archived report must not turn "not fully enforced" because 0.2
+        // reads it; a 0.2 advisory exec — a real, racy refusal — must count.
+        let advisory = |mechanism: &str| {
+            let mut u = unit_with(vec![], true);
+            u.tiers = BTreeMap::from([(
+                Capability::Exec.into(),
+                Tier::Advisory {
+                    mechanism: mechanism.into(),
+                    limitation: "x".into(),
+                },
+            )]);
+            u
+        };
+        assert!(!advisory("seccomp-notify-record").has_advisory_tier());
+        assert!(advisory("seccomp-notify").has_advisory_tier());
     }
 
     #[test]

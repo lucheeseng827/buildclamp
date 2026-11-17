@@ -241,11 +241,18 @@ pub struct EnforcementProfile {
     /// `hold-compile-units`. With it off, proc-macro expansion ran unheld — which is the
     /// half of the threat a build-script-only tool misses entirely.
     pub compile_units_held: bool,
-    /// Always `true`, and always recorded, because it is always true: destinations are
-    /// reported and never enforced. A field that can only hold one value looks redundant
-    /// and is not — a reader of the statement must not have to know this project's
-    /// documentation to find out that a destination list is not a control.
+    /// Always `true`: the v1 schema fixes it with `const`, and v1 is frozen. It was written
+    /// when destinations were never enforced. Since 0.2 a listed destination list is
+    /// enforced, and [`EnforcementProfile::net_destinations_enforced`] says whether it was;
+    /// read that one. A v2 predicate can retire this field.
     pub net_destinations_recorded_only: bool,
+    /// Whether every unit whose grant listed `net-destinations` ran with that list enforced
+    /// (`enforced:netns+connect-proxy`). `None` when no unit listed any. Derived from the
+    /// report by [`Predicate::from_report`], never taken from the caller.
+    ///
+    /// Optional and additive: the one in-place change a frozen schema takes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub net_destinations_enforced: Option<bool>,
     /// The Landlock ABI the run actually used, or `None` where Landlock was unavailable.
     /// ABI is a tier dimension: `landlock-v1` cannot restrict truncation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -319,11 +326,52 @@ impl Predicate {
                     .into(),
             );
         }
-        scope.not_held.push(
-            "Network destinations were recorded and never enforced. A destination list in \
-             the policy is a record of what was expected, not a control."
-                .into(),
-        );
+        // Destinations, from the run rather than the caller: a unit whose grant listed them
+        // either ran with the list enforced or it did not, and the report's tier says which.
+        let listed: Vec<&crate::report::UnitRecord> = report
+            .units
+            .iter()
+            .filter(|u| {
+                u.envelope.permits(crate::Capability::Net)
+                    && !u.envelope.net_destinations.is_empty()
+            })
+            .collect();
+        // Three outcomes, by the tier the run recorded: the list held (`netns+connect-proxy`);
+        // held more strictly, with no network at all, where the host could not hold a list
+        // (any other enforced tier — a refusal, never an opening); or not enforced, with the
+        // network open (advisory or none, as in observe mode).
+        fn net_tier(u: &crate::report::UnitRecord) -> Option<&Tier> {
+            u.tiers.get(&crate::Capability::Net.into())
+        }
+        let stricter: Vec<String> = listed
+            .iter()
+            .filter(|u| {
+                matches!(net_tier(u), Some(Tier::Enforced { mechanism }) if mechanism != "netns+connect-proxy")
+            })
+            .map(|u| u.id.to_string())
+            .collect();
+        let unenforced: Vec<String> = listed
+            .iter()
+            .filter(|u| !matches!(net_tier(u), Some(Tier::Enforced { .. })))
+            .map(|u| u.id.to_string())
+            .collect();
+        let mut profile = profile;
+        profile.net_destinations_enforced = (!listed.is_empty()).then_some(unenforced.is_empty());
+        if !stricter.is_empty() {
+            scope.not_held.push(format!(
+                "Network destinations could not be held for {}: none of the listed names \
+                 resolved, or the host lacked what a list needs, so those units ran with no \
+                 network at all — stricter than their grant.",
+                stricter.join(", ")
+            ));
+        }
+        if !unenforced.is_empty() {
+            scope.not_held.push(format!(
+                "Network destinations were recorded and not enforced for {}: those units had \
+                 the network, wherever it led.",
+                unenforced.join(", ")
+            ));
+        }
 
         Self {
             format_version: PREDICATE_VERSION,
@@ -1052,6 +1100,7 @@ mod tests {
             read_deny_ruleset_sha256: Some("sha256:aa".into()),
             compile_units_held: true,
             net_destinations_recorded_only: true,
+            net_destinations_enforced: None,
             landlock_abi_used: Some(7),
             disable_overrides: Vec::new(),
         }
@@ -1141,7 +1190,7 @@ mod tests {
     fn a_compile_recorded_as_unheld_is_not_fully_enforced_even_with_the_flag_on() {
         // The gap this closes, at the seam that closes it. When `hold-compile-units` is on
         // but one compilation cannot be held, `cargo-buildclamp` runs it unheld and records
-        // it with every non-observe-only capability at `Tier::None` — the shape built here.
+        // it with every capability at `Tier::None` — the shape built here.
         // The profile flag `compile_units_held` stays true (the option WAS on), so a report
         // that merely omitted the failed unit would read as fully enforced while a proc-macro
         // ran outside the sandbox. The per-unit `none:` tiers are what make the summary tell
@@ -1245,13 +1294,73 @@ mod tests {
         ]);
         let p = predicate(&r, everything_on());
         assert!(p.is_fully_enforced(), "{:?}", p.enforcement_summary);
-        // Even then the scope is not empty: destinations are never enforced, and a reader
-        // must not have to know this project's documentation to find that out.
-        assert!(p
+        // No unit listed destinations, so there is nothing to say about them — not a
+        // blanket "never enforced", which stopped being true in 0.2.
+        assert_eq!(p.enforcement_profile.net_destinations_enforced, None);
+        assert!(!p
             .scope
             .not_held
             .iter()
-            .any(|l| l.contains("recorded and never enforced")));
+            .any(|l| l.contains("Network destinations")));
+    }
+
+    #[test]
+    fn destinations_are_reported_as_enforced_only_where_the_run_enforced_them() {
+        let with_dests = |name: &str, tier: Tier| {
+            let mut u = unit(name, &[(Capability::Net, tier)]);
+            u.envelope.granted.insert(Capability::Net);
+            u.envelope.net_destinations = vec!["crates.io:443".into()];
+            u
+        };
+        let held = Tier::Enforced {
+            mechanism: "netns+connect-proxy".into(),
+        };
+        let all = predicate(
+            &report_with(vec![with_dests("a", held.clone())]),
+            everything_on(),
+        );
+        assert_eq!(
+            all.enforcement_profile.net_destinations_enforced,
+            Some(true)
+        );
+        assert!(!all
+            .scope
+            .not_held
+            .iter()
+            .any(|l| l.contains("Network destinations")));
+
+        let open = Tier::None {
+            reason: "the policy grants this unit the network".into(),
+        };
+        let some = predicate(
+            &report_with(vec![with_dests("a", held), with_dests("b", open)]),
+            everything_on(),
+        );
+        assert_eq!(
+            some.enforcement_profile.net_destinations_enforced,
+            Some(false)
+        );
+        assert!(some
+            .scope
+            .not_held
+            .iter()
+            .any(|l| l.contains("not enforced for b@1.0.0")));
+
+        // A host that could not hold the list gave the unit no network: stricter, so the
+        // list is not reported as broken, and the note says it ran with none.
+        let netns = Tier::Enforced {
+            mechanism: "netns".into(),
+        };
+        let strict = predicate(&report_with(vec![with_dests("c", netns)]), everything_on());
+        assert_eq!(
+            strict.enforcement_profile.net_destinations_enforced,
+            Some(true)
+        );
+        assert!(strict
+            .scope
+            .not_held
+            .iter()
+            .any(|l| l.contains("could not be held for c@1.0.0") && l.contains("no network")));
     }
 
     #[test]

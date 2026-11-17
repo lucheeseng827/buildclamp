@@ -279,6 +279,66 @@ fn an_ordinary_build_survives_having_its_compile_units_held() {
     assert_eq!(ungranted, 0, "an ordinary graph must ask for nothing extra");
 }
 
+#[test]
+fn a_held_compile_links_even_when_the_crate_grant_omits_exec() {
+    // A grant is written for a crate's build script, and one without `exec` refuses every
+    // exec that script makes. rustc is not the build script: it has to run the linker (and,
+    // under rustup, the proxy the real rustc) whatever the crate's grant says. Holding the
+    // compile of a crate whose grant omits `exec` used to refuse the linker and fail every
+    // build of a binary.
+    if !host_can_enforce() {
+        eprintln!("SKIP: this host has no user namespaces");
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("Cargo.toml"),
+        "[workspace]\n[package]\nname = \"linked\"\nversion = \"0.1.0\"\n\
+         edition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("src")).unwrap();
+    std::fs::write(dir.path().join("src/main.rs"), "fn main() {}\n").unwrap();
+    std::fs::write(
+        dir.path().join("buildclamp.toml"),
+        "version = 1\n\n[defaults]\nhold-compile-units = true\ntrust-workspace = false\n\n\
+         [grants.\"linked\"]\ncapabilities = [\"fs-write\"]\n\
+         write-zones = [\"target\", \"tmp\"]\nwhy = \"a grant without exec\"\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(dir.path().join("home")).unwrap();
+
+    let out = Command::new(bin())
+        .args(["buildclamp", "build"])
+        .current_dir(dir.path())
+        .env("HOME", dir.path().join("home"))
+        .output()
+        .expect("the binary runs");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "a held compile could not link a crate whose grant omits exec\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = std::fs::read_to_string(dir.path().join("target/buildclamp/report.json")).unwrap();
+    let report: serde_json::Value = serde_json::from_str(&text).unwrap();
+    // Held, not the unheld fallback: when a compile cannot be held, `hold_compile` runs
+    // it unheld and records every capability at `none`, and that build links too.
+    let held = |u: &serde_json::Value| {
+        u["tiers"]
+            .as_object()
+            .is_some_and(|t| t.values().any(|tier| tier["grade"] != "none"))
+    };
+    assert!(
+        report["units"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|u| u["kind"] == "compile" && u["id"]["name"] == "linked" && held(u)),
+        "the binary's compile must actually have been held, or this proves nothing"
+    );
+}
+
 /// A workspace whose compilation expands BOTH a probe macro that issues a syscall from its
 /// own code and a quiet one that does nothing — so `exact` attribution can be shown to name
 /// the culprit and only the culprit.

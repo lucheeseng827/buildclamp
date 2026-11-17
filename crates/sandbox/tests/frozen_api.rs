@@ -68,12 +68,23 @@ fn plan_carries_exactly_these_fields_at_exactly_these_types() {
         allow_unix: false,
         writable: Vec::<PathBuf>::new(),
         withheld_reads: Vec::<PathBuf>::new(),
+        // 0.2: the read allowlist. Empty by default, which restricts nothing.
+        read_allowed: Vec::<PathBuf>::new(),
         private_tmp: None::<PathBuf>,
         env: Vec::<(OsString, OsString)>::new(),
         observe_writes: false,
         observe_only: false,
         proc_macro_objects: Vec::<(PathBuf, UnitId)>::new(),
         skip_exec_target: None::<PathBuf>,
+        // 0.2: exec restriction. Additive, and the defaults restrict nothing — asserted
+        // below — so a consumer spreading `..Default::default()` sees no change.
+        deny_exec: false,
+        no_exec: Vec::<PathBuf>::new(),
+        exec_allowed: Vec::<PathBuf>::new(),
+        load_allowed: Vec::<PathBuf>::new(),
+        // 0.2: enforced destinations. Empty and None restrict nothing new.
+        net_allowed: Vec::<std::net::SocketAddr>::new(),
+        hosts: None::<String>,
     };
 
     // `Default` is part of the surface: a consumer writing `Plan { allow_net: true,
@@ -83,6 +94,8 @@ fn plan_carries_exactly_these_fields_at_exactly_these_types() {
     assert!(!from_default.allow_net);
     assert!(!from_default.observe_only);
     assert!(from_default.writable.is_empty());
+    assert!(!from_default.deny_exec);
+    assert!(from_default.no_exec.is_empty());
 
     // And `Clone` and `Debug`, which cost nothing to keep and break callers to remove.
     let cloned: Plan = plan.clone();

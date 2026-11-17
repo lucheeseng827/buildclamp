@@ -175,6 +175,20 @@ pub(crate) fn is_workspace_member() -> bool {
     }
 }
 
+/// The workspace members' manifest directories, from the trusted file the driver wrote, or
+/// none when there is no reliable list. Read by the read allowlist, which grants each one.
+pub(crate) fn workspace_member_dirs_from_env() -> Vec<std::path::PathBuf> {
+    std::env::var_os(buildclamp_core::ENV_WORKSPACE_MEMBERS)
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .map(|list| {
+            list.split('\n')
+                .filter(|m| !m.is_empty())
+                .map(std::path::PathBuf::from)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// The membership decision itself, split from the environment so it is testable without
 /// setting a process variable — which needs `unsafe` in the 2024 edition and races every
 /// sibling test that reads `environ`. `manifest_dir` is one entry to test against the

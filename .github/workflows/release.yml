@@ -1,0 +1,249 @@
+# buildclamp's release. Fires when release vX.Y.Z is published on this repository (created
+# with a token, not GITHUB_TOKEN, so that this workflow runs). From that tag it builds:
+#   - static binaries for Linux x86_64 and arm64 (musl), each a .tar.gz with a .sha256 and a
+#     build-provenance attestation, attached to the release — after the binary itself has
+#     shown, on a runner of its own architecture, that it reaches the enforcing tier and opens
+#     no socket of its own. Linux only: buildclamp enforces nothing anywhere else, and a macOS
+#     binary would be a download that holds nothing;
+#   - the image mancube/buildclamp:X.Y.Z, then :X.Y and :latest once it has run on both
+#     architectures, from THOSE binaries (no second compile, nothing built under emulation);
+#   - the four crates on crates.io, in dependency order, skipping any already published so
+#     a re-run after a partial failure finishes the job instead of failing on the first.
+#
+# The rule this file keeps, because this tool's subject is build scripts nobody has read: no
+# step that runs cargo — and so a dependency's build.rs — has a credential in reach. The
+# build job is read-only with no persisted token; attesting and uploading happen in a job
+# that never compiles; the crates.io token is absent while a crate is verified.
+#
+# Secrets, in this repo's `cicd` environment: DOCKER_USERNAME, DOCKER_PASSWORD, CRATESIO_TOKEN.
+name: release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to (re)build, e.g. v0.2.0"
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  IMAGE: mancube/buildclamp
+  # The floor ci.yml's gate job declares, asserted here by the binary that ships. Keep the two
+  # in step: a release must not be held to less than a pull request.
+  FLOOR: net=enforced,unix=enforced,fs-write=enforced,env-secret=enforced,exec=enforced
+
+concurrency:
+  group: release-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  meta:
+    name: the tag is the workspace version
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.v.outputs.tag }}
+      version: ${{ steps.v.outputs.version }}
+      minor: ${{ steps.v.outputs.minor }}
+      prerelease: ${{ steps.v.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ github.event.release.tag_name || inputs.tag }}
+          persist-credentials: false
+      - id: v
+        env:
+          TAG: ${{ github.event.release.tag_name || inputs.tag }}
+        run: |
+          set -euo pipefail
+          version=$(sed -n '/^\[workspace.package\]/,/^\[/s/^version = "\(.*\)"/\1/p' Cargo.toml)
+          [ "$TAG" = "v$version" ] || { echo "::error::tag $TAG does not match workspace version $version"; exit 1; }
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "minor=${version%.*}" >> "$GITHUB_OUTPUT"
+          case "$version" in *-*) echo "prerelease=true" ;; *) echo "prerelease=false" ;; esac >> "$GITHUB_OUTPUT"
+
+  # Compiles, so read-only and with no token on disk: a build script here can reach nothing
+  # worth having.
+  binaries:
+    name: binary ${{ matrix.target }}
+    needs: meta
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { target: x86_64-unknown-linux-musl,  runner: ubuntu-24.04,     arch: amd64 }
+          - { target: aarch64-unknown-linux-musl, runner: ubuntu-24.04-arm, arch: arm64 }
+    env:
+      TARGET: ${{ matrix.target }}
+      TAG: ${{ needs.meta.outputs.tag }}
+      VERSION: ${{ needs.meta.outputs.version }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+          persist-credentials: false
+      - name: toolchain
+        run: |
+          rustup toolchain install 1.94.0 --profile minimal --target "$TARGET"
+          rustup default 1.94.0
+      - name: musl tools
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends musl-tools
+      - name: build
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+        run: cargo build --release --locked -p cargo-buildclamp --target "$TARGET"
+      - name: static, and reports this version
+        run: |
+          set -euo pipefail
+          bin="target/$TARGET/release/cargo-buildclamp"
+          file "$bin" | grep -Eq 'statically linked|static-pie linked' || { file "$bin"; echo "::error::not static"; exit 1; }
+          out=$("$bin" buildclamp --version)
+          echo "$out"
+          case "$out" in *" $VERSION") ;; *) echo "::error::--version says '$out'"; exit 1 ;; esac
+      - name: this binary enforces the CI floor, and opens no socket of its own
+        run: |
+          set -euo pipefail
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          bin="target/$TARGET/release/cargo-buildclamp"
+          "$bin" buildclamp doctor --require "$FLOOR"
+          "$bin" buildclamp selftest --no-network
+      - name: package
+        run: |
+          set -euo pipefail
+          name="buildclamp-$TAG-$TARGET"
+          mkdir -p "pkg/$name" out
+          cp "target/$TARGET/release/cargo-buildclamp" LICENSE NOTICE README.md "pkg/$name/"
+          cp examples/baseline.toml "pkg/$name/buildclamp.example.toml"
+          tar -C pkg -czf "out/$name.tar.gz" "$name"
+          (cd out && sha256sum "$name.tar.gz" > "$name.tar.gz.sha256")
+          cp "target/$TARGET/release/cargo-buildclamp" out/cargo-buildclamp
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: bin-${{ matrix.arch }}
+          path: out/
+          if-no-files-found: error
+
+  # Never compiles: the only job that can attest or write to the release.
+  publish-binaries:
+    name: attest and attach the binaries
+    needs: [meta, binaries]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write       # attach to the release
+      id-token: write       # build-provenance attestation
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: bin-*
+          path: dist
+      # Verifiable with `gh attestation verify <tarball> --repo <this repo>`.
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*/*.tar.gz
+      - name: attach to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.meta.outputs.tag }}
+        run: gh release upload "$TAG" dist/*/*.tar.gz dist/*/*.tar.gz.sha256 --clobber --repo "$GITHUB_REPOSITORY"
+
+  image:
+    name: image (amd64 + arm64, from the release binaries)
+    needs: [meta, binaries]
+    runs-on: ubuntu-24.04
+    environment: cicd
+    env:
+      VERSION: ${{ needs.meta.outputs.version }}
+      MINOR: ${{ needs.meta.outputs.minor }}
+      PRERELEASE: ${{ needs.meta.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: bin-*
+          path: dist-raw
+      - name: lay out the bin context (<arch>/cargo-buildclamp)
+        run: |
+          set -euo pipefail
+          for a in amd64 arm64; do
+            mkdir -p "dist/$a"
+            install -m 0755 "dist-raw/bin-$a/cargo-buildclamp" "dist/$a/cargo-buildclamp"
+          done
+          find dist -type f
+      # Emulation for the arm64 smoke test, set up BEFORE the registry login: a privileged
+      # helper must never run with push credentials on disk.
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          platforms: arm64
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: log in to Docker Hub
+        env:
+          DOCKER_USERNAME: ${{ secrets.DOCKER_USERNAME }}
+          DOCKER_PASSWORD: ${{ secrets.DOCKER_PASSWORD }}
+        run: |
+          set -euo pipefail
+          [ -n "$DOCKER_USERNAME" ] && [ -n "$DOCKER_PASSWORD" ] || { echo "::error::DOCKER_USERNAME/DOCKER_PASSWORD are not set in the cicd environment"; exit 1; }
+          printf '%s' "$DOCKER_PASSWORD" | docker login -u "$DOCKER_USERNAME" --password-stdin
+      # The exact version only. The moving tags follow once it has run on both architectures,
+      # so a broken image never becomes `latest`.
+      - name: build and push the version tag
+        run: |
+          set -euo pipefail
+          docker buildx build --platform linux/amd64,linux/arm64 \
+            --build-context bin=dist \
+            --label org.opencontainers.image.source="https://github.com/${GITHUB_REPOSITORY}" \
+            --label org.opencontainers.image.version="$VERSION" \
+            --label org.opencontainers.image.licenses=Apache-2.0 \
+            -t "$IMAGE:$VERSION" --push .
+      - name: the pushed image runs, on both architectures
+        run: |
+          set -euo pipefail
+          for p in linux/amd64 linux/arm64; do
+            out=$(docker run --rm --platform "$p" "$IMAGE:$VERSION" buildclamp --version)
+            echo "$p: $out"
+            case "$out" in *" $VERSION") ;; *) echo "::error::$p image says '$out'"; exit 1 ;; esac
+          done
+      - name: promote to the moving tags
+        if: needs.meta.outputs.prerelease == 'false'
+        run: docker buildx imagetools create -t "$IMAGE:$MINOR" -t "$IMAGE:latest" "$IMAGE:$VERSION"
+
+  crates:
+    name: crates.io
+    needs: [meta, binaries]
+    runs-on: ubuntu-latest
+    environment: cicd
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          ref: ${{ needs.meta.outputs.tag }}
+          persist-credentials: false
+      - run: rustup toolchain install 1.94.0 --profile minimal && rustup default 1.94.0
+      # `cargo publish` verifies by building the packaged crate, which runs build scripts.
+      # So each crate is verified by `cargo package` with no token in its environment, and
+      # only then uploaded with `--no-verify`, which compiles nothing.
+      - name: publish in dependency order
+        env:
+          CRATESIO_TOKEN: ${{ secrets.CRATESIO_TOKEN }}
+          VERSION: ${{ needs.meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          [ -n "$CRATESIO_TOKEN" ] || { echo "::error::CRATESIO_TOKEN is not set in the cicd environment"; exit 1; }
+          # Leaves first; cargo waits for each to be in the index before the next.
+          for c in buildclamp-core buildclamp-sandbox buildclamp-shim cargo-buildclamp; do
+            code=$(curl -s -o /dev/null -w '%{http_code}' -A "buildclamp-release (github actions)" "https://crates.io/api/v1/crates/$c/$VERSION")
+            if [ "$code" = 200 ]; then echo "$c $VERSION is already on crates.io; skipping"; continue; fi
+            env -u CRATESIO_TOKEN cargo package --locked -p "$c"
+            CARGO_REGISTRY_TOKEN="$CRATESIO_TOKEN" cargo publish --locked --no-verify -p "$c"
+          done

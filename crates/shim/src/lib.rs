@@ -42,7 +42,7 @@ pub mod runrecord;
 pub mod swap;
 pub mod sweep;
 
-pub use crate::paths::{resolve_zones, UnitContext, UnitPaths};
+pub use crate::paths::{resolve_exec_zones, resolve_zones, UnitContext, UnitPaths};
 pub use crate::roles::{detect, PassReason, Role, WrapperAction};
 pub use crate::runrecord::RunDir;
 pub use crate::swap::{is_shim, swap, unswap, Swapped};

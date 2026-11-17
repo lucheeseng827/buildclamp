@@ -391,9 +391,22 @@ fn exceeds(envelope: &Envelope, ceiling: &Envelope) -> Option<String> {
             return Some(format!("write-zone `{z}`"));
         }
     }
+    // An exec zone widens exec, so a ceiling bounds it like a write zone — and exactly:
+    // `target` containing `out-dir` is a fact about where writes land, not permission to
+    // run whatever was written anywhere beneath it.
+    for z in &envelope.exec_zones {
+        if !ceiling.exec_zones.contains(z) {
+            return Some(format!("exec-zone `{z}`"));
+        }
+    }
     for p in &envelope.write_paths {
         if !ceiling.write_paths.contains(p) {
             return Some(format!("write-path `{p}`"));
+        }
+    }
+    for p in &envelope.read_paths {
+        if !ceiling.read_paths.contains(p) {
+            return Some(format!("read-path `{p}`"));
         }
     }
     for n in &envelope.env_allow {
@@ -555,6 +568,37 @@ mod tests {
         let msg = err.to_string();
         assert!(msg.contains("repo/buildclamp.toml"), "{msg}");
         assert!(msg.contains("org/buildclamp.toml"), "{msg}");
+    }
+
+    #[test]
+    fn a_ceiling_bounds_exec_zones_exactly() {
+        // An exec zone widens exec. The org's grant for openssl-sys names none, so a repo
+        // may not add one — and `target` containing `out-dir` for writes must not become
+        // permission to run what was written.
+        let stack = Stack::new(vec![
+            layer("org", ORG),
+            layer(
+                "repo",
+                r#"
+                version = 2
+                [layer]
+                name = "repo"
+                [grants."openssl-sys"]
+                capabilities = ["net", "fs-write", "exec", "unix"]
+                write-zones = ["out-dir", "tmp"]
+                exec-zones = ["out-dir"]
+                why = "runs the configure probes it builds"
+                "#,
+            ),
+        ])
+        .unwrap();
+        let err = stack
+            .resolve(&unit("openssl-sys"), UnitKind::BuildScriptCompile, false)
+            .expect_err("a repo may not add an exec zone above a ceiling");
+        let PolicyError::LayerWouldWiden(conflict) = &err else {
+            panic!("{err}");
+        };
+        assert_eq!(conflict.capability, "exec-zone `out-dir`");
     }
 
     #[test]

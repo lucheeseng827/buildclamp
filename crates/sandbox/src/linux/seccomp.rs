@@ -195,10 +195,202 @@ pub fn recv_listener(sock: RawFd) -> io::Result<Option<OwnedFd>> {
 
 // --- the notification protocol ------------------------------------------------------
 
-const SECCOMP_IOCTL_NOTIF_RECV: libc::c_ulong = 0xc0502100;
-const SECCOMP_IOCTL_NOTIF_SEND: libc::c_ulong = 0xc0182101;
-const SECCOMP_IOCTL_NOTIF_ID_VALID: libc::c_ulong = 0x40082102;
+// `libc::Ioctl`, not `c_ulong`: musl's ioctl takes an `int` request, and the release binaries
+// are musl. The kernel reads the request as a 32-bit `unsigned int`, so the sign musl's cast
+// gives the top bit does not reach it.
+const SECCOMP_IOCTL_NOTIF_RECV: libc::Ioctl = 0xc0502100_u32 as libc::Ioctl;
+const SECCOMP_IOCTL_NOTIF_SEND: libc::Ioctl = 0xc0182101_u32 as libc::Ioctl;
+const SECCOMP_IOCTL_NOTIF_ID_VALID: libc::Ioctl = 0x40082102_u32 as libc::Ioctl;
 const SECCOMP_USER_NOTIF_FLAG_CONTINUE: u32 = 1;
+/// `SECCOMP_IOW(3, struct seccomp_notif_addfd)`: install a descriptor in the target.
+const SECCOMP_IOCTL_NOTIF_ADDFD: libc::Ioctl = 0x40182103_u32 as libc::Ioctl;
+/// Replace the target's descriptor `newfd`, as `dup2` would, rather than taking the lowest
+/// free number.
+const SECCOMP_ADDFD_FLAG_SETFD: u32 = 1;
+const SYS_PIDFD_OPEN: libc::c_long = 434;
+const SYS_PIDFD_GETFD: libc::c_long = 438;
+
+/// `struct seccomp_notif_addfd`.
+#[repr(C)]
+struct SeccompNotifAddfd {
+    id: u64,
+    flags: u32,
+    srcfd: u32,
+    newfd: u32,
+    newfd_flags: u32,
+}
+
+/// The unit's socket `fd`, borrowed through a pidfd, with its thread-group id and type.
+///
+/// Descriptors belong to the process, so the notifying thread's thread-group leader is the
+/// one to open. The notification is re-validated once the pidfd is held: between the
+/// receive and the `/proc` read the target may have died and its pid been reused, and the
+/// pidfd pins whichever process it opened. Any failure is `Err`, and every caller treats
+/// that as a refusal.
+fn borrow_socket(
+    listener: i32,
+    notif: &SeccompNotif,
+    fd: i32,
+) -> Result<(std::os::fd::OwnedFd, i32, i32), i32> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let tgid = std::fs::read_to_string(format!("/proc/{}/status", notif.pid))
+        .ok()
+        .and_then(|s| {
+            s.lines()
+                .find_map(|l| l.strip_prefix("Tgid:").map(|v| v.trim().parse::<i32>()))
+        })
+        .and_then(Result::ok)
+        .ok_or(libc::EACCES)?;
+    // SAFETY: plain syscalls on integers; every returned descriptor is owned below.
+    let pidfd = unsafe { libc::syscall(SYS_PIDFD_OPEN, tgid, 0) } as i32;
+    if pidfd < 0 {
+        return Err(libc::EACCES);
+    }
+    let pidfd = unsafe { OwnedFd::from_raw_fd(pidfd) };
+    if !id_valid(listener, notif.id) {
+        return Err(libc::EACCES);
+    }
+    let theirs = unsafe { libc::syscall(SYS_PIDFD_GETFD, pidfd.as_raw_fd(), fd, 0) } as i32;
+    if theirs < 0 {
+        return Err(libc::EACCES);
+    }
+    let theirs = unsafe { OwnedFd::from_raw_fd(theirs) };
+    let mut ty: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: `ty` and `len` are live locals of the sizes passed.
+    let rc = unsafe {
+        libc::getsockopt(
+            theirs.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_TYPE,
+            &mut ty as *mut _ as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if rc != 0 {
+        return Err(libc::EACCES);
+    }
+    Ok((theirs, tgid, ty))
+}
+
+/// Make the connection a unit asked for, here, and give it the connected socket.
+///
+/// The unit is in an empty network namespace, so its own `connect` could reach nothing;
+/// this process can. It connects to `addr` — the address it decided on, not one re-read
+/// from the unit's memory — and swaps the result into the unit's descriptor table at the
+/// number the unit passed to `connect`, then answers the syscall with success. TCP only:
+/// the unit's socket is inspected first, and anything but a stream socket is refused.
+///
+/// The replacement is a new socket. Non-blocking, close-on-exec, `TCP_NODELAY` and
+/// `SO_KEEPALIVE` are carried over; anything else the unit set before connecting — a local
+/// `bind`, buffer sizes, other options — is not, and the docs say so.
+///
+/// # Ceiling
+///
+/// ponytail: the connect runs on the supervisor thread with a 10 s timeout, so a slow
+/// destination stalls every other notification of that unit for as long. Move it to a
+/// worker per connect if a build ever waits on that.
+fn proxy_connect(
+    listener: i32,
+    notif: &SeccompNotif,
+    addr: std::net::SocketAddr,
+) -> Result<(), i32> {
+    use std::os::fd::{AsRawFd, IntoRawFd};
+    let sockfd = notif.data.args[0] as i32;
+    let (theirs, tgid, ty) = borrow_socket(listener, notif, sockfd)?;
+    if ty != libc::SOCK_STREAM {
+        // A datagram "connect" to an allowed address is not something this can make on
+        // the unit's behalf with the same meaning. Refused, not guessed at.
+        return Err(libc::EPERM);
+    }
+    // SAFETY: a valid descriptor.
+    let nonblocking =
+        unsafe { libc::fcntl(theirs.as_raw_fd(), libc::F_GETFL) } & libc::O_NONBLOCK != 0;
+
+    let stream = std::net::TcpStream::connect_timeout(&addr, std::time::Duration::from_secs(10))
+        .map_err(|e| {
+            // `connect_timeout` reports its own timeout with no OS error behind it.
+            e.raw_os_error().unwrap_or(match e.kind() {
+                io::ErrorKind::TimedOut => libc::ETIMEDOUT,
+                _ => libc::ECONNREFUSED,
+            })
+        })?;
+    if nonblocking {
+        // The unit asked for a non-blocking socket and polls it as one.
+        stream.set_nonblocking(true).map_err(|_| libc::EIO)?;
+    }
+    // The two options clients most often set before connecting. Copied best-effort: a
+    // failure leaves the default, which is what an unset option would have been.
+    for (level, opt) in [
+        (libc::IPPROTO_TCP, libc::TCP_NODELAY),
+        (libc::SOL_SOCKET, libc::SO_KEEPALIVE),
+    ] {
+        let mut v: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        // SAFETY: `v` and `len` are live locals of the sizes passed; both fds are open.
+        unsafe {
+            if libc::getsockopt(
+                theirs.as_raw_fd(),
+                level,
+                opt,
+                &mut v as *mut _ as *mut libc::c_void,
+                &mut len,
+            ) == 0
+            {
+                libc::setsockopt(
+                    stream.as_raw_fd(),
+                    level,
+                    opt,
+                    &v as *const _ as *const libc::c_void,
+                    len,
+                );
+            }
+        }
+    }
+    // Close-on-exec is a property of the descriptor, not the file, so the copy above does not
+    // carry it; fdinfo does. Replacing the descriptor must keep what the unit asked for, or
+    // a socket opened with SOCK_CLOEXEC would leak into every program it spawns.
+    let cloexec = std::fs::read_to_string(format!("/proc/{tgid}/fdinfo/{sockfd}"))
+        .ok()
+        .and_then(|s| {
+            s.lines().find_map(|l| {
+                l.strip_prefix("flags:")
+                    .map(|v| u32::from_str_radix(v.trim(), 8))
+            })
+        })
+        .and_then(Result::ok)
+        .is_some_and(|f| f & libc::O_CLOEXEC as u32 != 0);
+    // fdinfo is read by path, so check the notification is still the one we pinned: if the
+    // unit died and its pid was reused, that flag came from another process.
+    if !id_valid(listener, notif.id) {
+        return Err(libc::EPERM);
+    }
+    let ours = stream.into_raw_fd();
+    let req = SeccompNotifAddfd {
+        id: notif.id,
+        flags: SECCOMP_ADDFD_FLAG_SETFD,
+        srcfd: ours as u32,
+        newfd: sockfd as u32,
+        newfd_flags: if cloexec { libc::O_CLOEXEC as u32 } else { 0 },
+    };
+    // SAFETY: `req` is a live, correctly sized struct naming the notification in flight.
+    let rc = unsafe { libc::ioctl(listener, SECCOMP_IOCTL_NOTIF_ADDFD, &req) };
+    let err = if rc < 0 {
+        Some(
+            io::Error::last_os_error()
+                .raw_os_error()
+                .unwrap_or(libc::EIO),
+        )
+    } else {
+        None
+    };
+    // SAFETY: we own `ours`; the unit now holds its own copy.
+    unsafe { libc::close(ours) };
+    match err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -241,11 +433,23 @@ pub enum Decision {
     AllowButWouldRefuse,
     /// Fail it with this errno.
     Deny(i32),
+    /// A `connect` to an allowed destination: the supervisor connects to this address
+    /// itself, in its own network namespace, and replaces the unit's socket with the
+    /// connected one. The kernel never runs the unit's `connect`, so there is no CONTINUE
+    /// and nothing for the unit to change between the decision and the connection.
+    Proxy(std::net::SocketAddr),
 }
 
 /// How the supervisor decides. Supplied by the caller so this module stays free of policy.
 pub trait Decider: Send {
     fn decide(&self, cap: Capability, target: &str) -> Decision;
+
+    /// Whether the unit is in destination mode: an empty network namespace, with the
+    /// supervisor making its listed connections. The one condition under which a datagram
+    /// `connect` is harmless enough to let through. `false` unless a decider says so.
+    fn destination_mode(&self) -> bool {
+        false
+    }
 }
 
 /// Run the supervisor loop until the listener hangs up.
@@ -317,16 +521,59 @@ pub fn supervise(
             Some(dst) => stricter(decision, decider.decide(cap, dst)),
             None => decision,
         };
+        // glibc's getaddrinfo ranks candidate addresses with a UDP socket: `connect` to each
+        // at port 0, then `connect(AF_UNSPEC)` to reset it for the next. With a destination
+        // list (which the decider vouches for) these probes are answered here and NOT
+        // recorded: recording them would feed `init` destinations nobody chose.
+        //
+        // Enforcing, they are refused (ENETUNREACH), never CONTINUEd. A CONTINUE lets the
+        // kernel re-read the descriptor and the address after we answer, and the unit holds
+        // a proxied socket that lives in the HOST's namespace: one thread could `dup2` it over
+        // the probe's descriptor and rewrite the address, disconnecting it and then aiming it
+        // anywhere. glibc ignores both results — an unranked candidate is still tried.
+        // Observing, there is no proxied socket and nothing is refused, so they continue.
+        //
+        // Port 0 and AF_UNSPEC only. A datagram connect to a real port (a crate's own DNS,
+        // QUIC, telemetry) is network use, decided and recorded like any other.
+        let datagram_probe = decider.destination_mode()
+            && cap == Capability::Net
+            && syscall == "connect"
+            && (target.ends_with(":0") || target == "AF_UNSPEC address")
+            && borrow_socket(fd, &notif, notif.data.args[0] as i32)
+                .is_ok_and(|(_, _, ty)| ty == libc::SOCK_DGRAM);
+        let decision = match decision {
+            _ if datagram_probe => match decision {
+                Decision::Deny(_) | Decision::Proxy(_) => Decision::Deny(libc::ENETUNREACH),
+                _ => Decision::Allow,
+            },
+            // Only a `connect` can be made on the unit's behalf: any other syscall naming a
+            // listed address (a `bind`, say) is refused rather than answered with a swap.
+            Decision::Proxy(_) if syscall != "connect" => Decision::Deny(libc::EPERM),
+            d => d,
+        };
         let mut resp = SeccompNotifResp {
             id: notif.id,
             ..Default::default()
         };
+        // A proxy that refused — EPERM, not a TCP socket; EACCES, a socket it could not
+        // borrow (pidfd_getfd refused) — is a refusal, not a network failure, and is
+        // recorded as one, with the errno that tells the two apart.
+        let mut proxy_refused: Option<i32> = None;
         match decision {
             // CONTINUE requires val and error to be zero, which Default gives.
             Decision::Allow | Decision::AllowButWouldRefuse => {
                 resp.flags = SECCOMP_USER_NOTIF_FLAG_CONTINUE
             }
             Decision::Deny(e) => resp.error = -e,
+            // Success (val 0, no CONTINUE): the unit's connect returns 0 with the socket we
+            // connected in its place. A failed connect returns that connect's errno, which
+            // is the network's answer, not the policy's.
+            Decision::Proxy(addr) => {
+                if let Err(e) = proxy_connect(fd, &notif, addr) {
+                    resp.error = -e;
+                    proxy_refused = (e == libc::EPERM || e == libc::EACCES).then_some(e);
+                }
+            }
         }
         // SAFETY: `resp` is a live, correctly sized response naming the id just received.
         // ENOENT here means the target vanished while the notification was in flight,
@@ -343,6 +590,9 @@ pub fn supervise(
             skip_exec_target = None;
             continue;
         }
+        if datagram_probe {
+            continue;
+        }
 
         let request = Request {
             at_ms: started.elapsed().as_millis() as u64,
@@ -356,7 +606,10 @@ pub fn supervise(
                 None => target,
             },
             outcome: match decision {
-                Decision::Allow => Outcome::Granted,
+                Decision::Proxy(_) if proxy_refused.is_some() => Outcome::Ungranted {
+                    errno: proxy_refused.unwrap_or(libc::EPERM),
+                },
+                Decision::Allow | Decision::Proxy(_) => Outcome::Granted,
                 Decision::AllowButWouldRefuse => Outcome::WouldBeUngranted,
                 Decision::Deny(e) => Outcome::Ungranted { errno: e },
             },
@@ -489,10 +742,19 @@ fn describe(notif: &SeccompNotif, tid: i32) -> (Capability, &'static str, String
             let (cap, target) = read_sockaddr(tid, a[1], a[2] as usize);
             (cap, sys, target, None)
         }
-        "execve" | "execveat" => (
+        // Resolved like the write paths below, so `./conftest` run from `OUT_DIR` is decided
+        // — and reported — as the file in `OUT_DIR` it is, not as a bare relative name the
+        // no-exec rule could never match.
+        "execve" => (
             Capability::Exec,
             sys,
-            read_path(tid, if sys == "execve" { a[0] } else { a[1] }),
+            resolve_at(tid, libc::AT_FDCWD, &read_path(tid, a[0])),
+            None,
+        ),
+        "execveat" => (
+            Capability::Exec,
+            sys,
+            resolve_at(tid, a[0] as i32, &read_path(tid, a[1])),
             None,
         ),
         // The `*at` family takes a directory descriptor and a path that may be relative to
@@ -583,6 +845,7 @@ fn stricter(a: Decision, b: Decision) -> Decision {
         (Decision::AllowButWouldRefuse, _) | (_, Decision::AllowButWouldRefuse) => {
             Decision::AllowButWouldRefuse
         }
+        (Decision::Proxy(p), _) | (_, Decision::Proxy(p)) => Decision::Proxy(p),
         _ => Decision::Allow,
     }
 }
@@ -649,6 +912,7 @@ fn family_name(domain: i32) -> &'static str {
         libc::AF_UNIX => "AF_UNIX",
         libc::AF_NETLINK => "AF_NETLINK",
         libc::AF_PACKET => "AF_PACKET",
+        libc::AF_UNSPEC => "AF_UNSPEC",
         _ => "unknown-family",
     }
 }

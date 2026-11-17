@@ -116,7 +116,11 @@
         "net_destinations_recorded_only": {
           "type": "boolean",
           "const": true,
-          "description": "Always true, and recorded anyway: a reader must not have to know this project's documentation to find out that a destination list is not a control."
+          "description": "Fixed at true by the v1 schema. It describes buildclamp before 0.2, when a destination list was recorded and never enforced; from 0.2 read net_destinations_enforced instead."
+        },
+        "net_destinations_enforced": {
+          "type": "boolean",
+          "description": "Added in buildclamp 0.2, optional. True when every unit whose grant listed net-destinations ran with that list enforced (enforced:netns+connect-proxy) or more strictly (another enforced tier: the host could not hold a list, so the unit had no network); false when at least one ran with the network open (advisory or none); absent when no unit listed any. Read this rather than net_destinations_recorded_only, which v1 fixes at true and which describes buildclamp before 0.2."
         },
         "landlock_abi_used": {
           "type": ["integer", "null"],

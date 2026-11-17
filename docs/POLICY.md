@@ -60,12 +60,11 @@ capabilities = ["net", "fs-write", "exec", "unix"]
 net-destinations = ["downloads.example.org:443"]
 ```
 
-`net-destinations` is **reported and never enforced**, and the format says so in the same
-sentence as the field. Enforcing a destination allowlist would need a resolving proxy, and
-a tool that appeared to enforce one while a build script can resolve a name itself is worse
-than one that admits it does not. Write them down anyway: the destination is the single
-most useful line in an incident, and the report records what was actually reached, so a
-difference between the two is a finding.
+`net-destinations` is **enforced since 0.2**: with `net` and a non-empty list a build script
+reaches only those `host:port`s, over TCP, resolved when it starts. Write host names, not
+addresses, so the list survives a CDN moving. Write them down: the destination is the single
+most useful line in an incident. A connection outside them is refused, and the report names
+it — that refusal is the finding.
 
 ### It writes outside `OUT_DIR`
 
@@ -120,7 +119,10 @@ being noise.
 Two grants for one crate at the same specificity is an **error**, not last-one-wins: a
 policy whose meaning depends on the order of its lines is one nobody can review. A
 version-qualified grant beats an unqualified one, so a tie only happens when the policy is
-genuinely ambiguous. A crate needing two envelopes at two versions is written as two blocks:
+genuinely ambiguous. The tie is reported when the policy loads, by a sweep over versions
+taken from the requirements themselves, so the version it names is the first one that
+collides; it is a sweep, not a proof, and a tie only some other version reaches is caught
+when that version builds. A crate needing two envelopes at two versions is written as two blocks:
 
 ```toml
 [[grants."libc"]]

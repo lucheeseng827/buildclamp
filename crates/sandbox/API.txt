@@ -60,6 +60,7 @@ linux::landlock::fn handled_access
 linux::landlock::fn mechanism
 linux::landlock::fn raw_fd
 linux::landlock::fn read_roots
+linux::landlock::struct ExecRule
 linux::landlock::struct Ruleset
 linux::landlock::unsafe fn restrict_self
 linux::mod attribution
@@ -69,6 +70,8 @@ linux::mod landlock
 linux::mod ns
 linux::mod seccomp
 linux::ns::fn new
+linux::ns::fn with_hosts_file
+linux::ns::fn with_noexec
 linux::ns::struct Prepared
 linux::ns::unsafe fn apply_in_child
 linux::seccomp::enum Decision

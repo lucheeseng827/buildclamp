@@ -55,6 +55,10 @@ fn landlock_abi() -> Option<i64> {
 /// A workspace whose dependency's build script reads credentials out of a planted `HOME`.
 struct Victim {
     dir: tempfile::TempDir,
+    /// The home directory, OUTSIDE the workspace, which is where a real one is relative to
+    /// a project: the workspace is an allowed root under `read-allowlist`, and a home planted
+    /// inside it would be readable for that reason alone.
+    home: tempfile::TempDir,
 }
 
 impl Victim {
@@ -76,7 +80,8 @@ impl Victim {
         // The planted credentials. Obvious placeholders: a fixture carrying anything that
         // looked like a live key would be a liability in a public repository, and the test
         // only needs the paths to exist with known contents.
-        let home = dir.path().join("home");
+        let home_dir = tempfile::tempdir().expect("a scratch home");
+        let home = home_dir.path().to_path_buf();
         for (rel, body) in [
             (
                 ".aws/credentials",
@@ -91,19 +96,25 @@ impl Victim {
                 ".cargo/credentials.toml",
                 "[registry]\ntoken = \"PLACEHOLDER\"\n",
             ),
+            (".config/sometool/token", "UNLISTED-PLACEHOLDER\n"),
         ] {
             let p = home.join(rel);
             std::fs::create_dir_all(p.parent().unwrap()).unwrap();
             std::fs::write(p, body).unwrap();
         }
-        Self { dir }
+        Self {
+            dir,
+            home: home_dir,
+        }
     }
 
-    fn policy(&self, withhold: bool) {
-        let text = if withhold {
-            "version = 1\n\n[defaults]\nwithhold-secret-reads = true\n"
-        } else {
-            "version = 1\n"
+    /// `""` for no read restriction, `"withhold"` for the deny-list, `"allowlist"` for the
+    /// read allowlist.
+    fn policy(&self, mode: &str) {
+        let text = match mode {
+            "withhold" => "version = 1\n\n[defaults]\nwithhold-secret-reads = true\n",
+            "allowlist" => "version = 2\n\n[defaults]\nread-allowlist = true\n",
+            _ => "version = 1\n",
         };
         std::fs::write(self.dir.path().join("buildclamp.toml"), text).unwrap();
     }
@@ -116,7 +127,7 @@ impl Victim {
         Command::new(bin())
             .args(["buildclamp", "check"])
             .current_dir(self.dir.path())
-            .env("HOME", self.dir.path().join("home"))
+            .env("HOME", self.home.path())
             .output()
             .expect("the binary runs")
     }
@@ -148,6 +159,21 @@ impl Victim {
             refused.expect("the fixture wrote REFUSED"),
             listed.expect("the fixture wrote LISTED_SSH_ENTRIES"),
         )
+    }
+
+    /// `LOOT_BYTES`: how many bytes of credential reached `OUT_DIR`. The README quotes it.
+    fn loot_bytes(&self) -> usize {
+        walk(&self.dir.path().join("target"))
+            .into_iter()
+            .find(|p| p.file_name().is_some_and(|n| n == "loot.rs"))
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|t| {
+                t.lines()
+                    .find(|l| l.contains("LOOT_BYTES"))
+                    .and_then(|l| l.rsplit_once("= "))
+                    .and_then(|(_, v)| v.trim_end_matches(';').parse().ok())
+            })
+            .expect("the fixture wrote LOOT_BYTES")
     }
 
     /// The `fs-read` tier label from the run's report.
@@ -189,7 +215,7 @@ fn a_build_script_reads_every_planted_credential_when_nothing_withholds_them() {
     // The baseline, and it is asserted rather than assumed. Without it the enforced test
     // below cannot tell a refusal from a fixture that never found the files.
     let v = Victim::new();
-    v.policy(false);
+    v.policy("");
     let out = v.check();
     assert_eq!(
         out.status.code(),
@@ -200,7 +226,8 @@ fn a_build_script_reads_every_planted_credential_when_nothing_withholds_them() {
 
     let (staged, refused, listed) = v.outcome();
     assert_eq!(refused, 0, "every planted credential must be readable here");
-    assert_eq!(staged, 4, "all four were staged into OUT_DIR");
+    assert_eq!(staged, 5, "all five were staged into OUT_DIR");
+    assert_eq!(v.loot_bytes(), 278, "the README's figure for this column");
     assert!(listed >= 1, "and ~/.ssh could be listed");
 
     // The tier says what it is: nothing withheld, so nothing enforced, and the reason
@@ -215,7 +242,7 @@ fn a_withheld_credential_is_refused_at_a_named_enforced_tier() {
         return;
     };
     let v = Victim::new();
-    v.policy(true);
+    v.policy("withhold");
     let out = v.check();
     assert_eq!(
         out.status.code(),
@@ -225,8 +252,20 @@ fn a_withheld_credential_is_refused_at_a_named_enforced_tier() {
     );
 
     let (staged, refused, listed) = v.outcome();
-    assert_eq!(staged, 0, "nothing may be staged into OUT_DIR");
-    assert_eq!(refused, 4, "every planted credential must be refused");
+    assert_eq!(
+        refused, 4,
+        "every credential on the deny-list must be refused"
+    );
+    assert_eq!(
+        staged, 1,
+        "and the one it does not name is still read: a deny-list's residue, stated by the \
+         README and measured here. The read allowlist is what closes it"
+    );
+    assert_eq!(
+        v.loot_bytes(),
+        48,
+        "the README's figure: the unlisted token alone"
+    );
     assert_eq!(
         listed, 0,
         "listing ~/.ssh must be refused too — READ_DIR and READ_FILE are different \
@@ -240,16 +279,21 @@ fn a_withheld_credential_is_refused_at_a_named_enforced_tier() {
 }
 
 #[test]
-fn staging_a_withheld_path_into_out_dir_fails_rather_than_staging_nothing_quietly() {
+fn under_the_allowlist_no_credential_byte_reaches_out_dir() {
     // `OUT_DIR` is `include!`d into the crate by design, so a build script that can read a
     // credential and write to `OUT_DIR` has exfiltrated it with no network involved. This
     // asserts the first half is gone: LOOT_BYTES is what actually reached the file.
+    //
+    // It ran under the deny-list until the fixture planted a token no list names; under the
+    // deny-list that token now does reach OUT_DIR (48 bytes), which
+    // `a_withheld_credential_is_refused_at_a_named_enforced_tier` asserts, so the deny-list's
+    // staging is still covered there. "Nothing reaches OUT_DIR" is only true of the allowlist.
     let Some(_) = landlock_abi() else {
         eprintln!("SKIP: this host has no Landlock, so a read restriction cannot be shown");
         return;
     };
     let v = Victim::new();
-    v.policy(true);
+    v.policy("allowlist");
     assert_eq!(v.check().status.code(), Some(0));
 
     let loot = walk(&v.dir.path().join("target"))
@@ -277,7 +321,7 @@ fn an_ordinary_read_still_works_while_credentials_are_withheld() {
         return;
     };
     let v = Victim::new();
-    v.policy(true);
+    v.policy("withhold");
     let out = v.check();
     assert_eq!(out.status.code(), Some(0));
 
@@ -288,4 +332,34 @@ fn an_ordinary_read_still_works_while_credentials_are_withheld() {
         v.dir.path().join("target/buildclamp/report.json").exists(),
         "the run completed and wrote a report"
     );
+}
+
+#[test]
+fn the_read_allowlist_refuses_every_credential_including_ones_no_list_names() {
+    let Some(abi) = landlock_abi() else {
+        eprintln!("SKIP: this host has no Landlock, so a read restriction cannot be shown");
+        return;
+    };
+    let v = Victim::new();
+    v.policy("allowlist");
+    let out = v.check();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "the build itself must still compile under the allowlist\n{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (staged, refused, listed) = v.outcome();
+    assert_eq!(
+        staged, 0,
+        "nothing in the home directory is on the allowlist"
+    );
+    assert_eq!(refused, 5, "the unlisted token is refused with the rest");
+    assert_eq!(
+        v.loot_bytes(),
+        0,
+        "the README's figure: nothing reaches OUT_DIR"
+    );
+    assert_eq!(listed, 0, "and ~/.ssh cannot be listed");
+    assert_eq!(v.read_tier(), format!("enforced:landlock-v{abi}"));
 }

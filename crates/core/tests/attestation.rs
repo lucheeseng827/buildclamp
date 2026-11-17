@@ -89,6 +89,7 @@ fn full_predicate() -> Predicate {
             read_deny_ruleset_sha256: Some("d".repeat(64)),
             compile_units_held: true,
             net_destinations_recorded_only: true,
+            net_destinations_enforced: None,
             landlock_abi_used: Some(7),
             disable_overrides: vec!["BUILDCLAMP_DISABLE=ns".into()],
         },

@@ -57,9 +57,24 @@ jobs:
           rustup toolchain install 1.91.0 --profile minimal
           cargo +1.91.0 check --workspace --locked
 
+      # The release binaries are static musl, and musl's libc types differ from glibc's
+      # (ioctl takes an `int` request). Measured: the sandbox did not compile for musl at all
+      # until this check existed, and the only place that would have shown it was a release.
+      - name: the release target compiles (musl)
+        run: |
+          sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends musl-tools
+          rustup target add x86_64-unknown-linux-musl
+          CC_x86_64_unknown_linux_musl=musl-gcc cargo check --locked -p cargo-buildclamp --target x86_64-unknown-linux-musl
+
   fixtures:
-    name: the two gates that matter
-    runs-on: ubuntu-latest
+    # Both architectures a release ships a binary for. The seccomp filter is built per
+    # architecture (bpf.rs: Arch::NATIVE), so an x86_64 pass says nothing about arm64.
+    name: the two gates that matter${{ matrix.runner == 'ubuntu-24.04-arm' && ' (arm64)' || '' }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install 1.94.0 --profile minimal && rustup default 1.94.0
@@ -108,12 +123,11 @@ jobs:
       # and fs-read is allow-by-default: reads are unrestricted unless a policy sets
       # `withhold-secret-reads`, which this lane does not. So `doctor` truthfully projects
       # fs-read as `none` ("the policy withholds no reads"), and a bare floor would fail on
-      # every host, forever, over a capability this lane never asked to enforce. exec is out
-      # for the adjacent reason: it is observe-only and enforceable nowhere. Requiring the
-      # four we hold is the floor; requiring five we do not would be the overclaim this tool
-      # exists to refuse.
+      # every host, forever, over a capability this lane never asked to enforce. exec is in:
+      # since 0.2 write xor execute is enforced by Landlock, which this runner has, so the
+      # lane requires it like the other four.
       - name: this lane declares the enforcement floor it needs
-        run: cargo run --locked -p cargo-buildclamp -- buildclamp doctor --require net=enforced,unix=enforced,fs-write=enforced,env-secret=enforced
+        run: cargo run --locked -p cargo-buildclamp -- buildclamp doctor --require net=enforced,unix=enforced,fs-write=enforced,env-secret=enforced,exec=enforced
 
       # buildclamp's own artefact boundary, checked at run time on this machine rather
       # than against the dependency graph. `no-network-closure.sh` in the invariants job
@@ -309,6 +323,14 @@ jobs:
             echo "::error::tests/fixtures must be excluded from the workspace, never a member"
             exit 1
           fi
+
+      - name: a release is held to the same floor as a pull request
+        run: |
+          set -euo pipefail
+          gate=$(grep -o 'doctor --require [a-z=,-]*' .github/workflows/ci.yml | head -1 | cut -d' ' -f3)
+          release=$(sed -n 's/^  FLOOR: //p' .github/workflows/release.yml)
+          echo "gate:    $gate"; echo "release: $release"
+          [ -n "$gate" ] && [ "$gate" = "$release" ] || { echo "::error::release.yml's FLOOR differs from the gate's --require"; exit 1; }
 
   oss-stands-alone:
     name: the tool builds and tests standalone

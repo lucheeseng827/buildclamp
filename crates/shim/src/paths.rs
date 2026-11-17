@@ -112,6 +112,21 @@ pub fn resolve_zones(envelope: &Envelope, ctx: &UnitContext) -> UnitPaths {
     }
 }
 
+/// The directories a unit may run programs from although it can write them: the paths of
+/// its `exec-zones`. Every other writable directory is no-exec.
+///
+/// Resolved by the same function as the write zones, so an exec zone names exactly the
+/// directory the matching write zone does. `write-paths` are never executable, and the run
+/// directory — where the unit writes its own record — is not a zone at all.
+pub fn resolve_exec_zones(envelope: &Envelope, ctx: &UnitContext) -> Vec<PathBuf> {
+    let mut only = envelope.clone();
+    only.write_zones = envelope.exec_zones.clone();
+    only.write_paths = Vec::new();
+    let mut dirs = resolve_zones(&only, ctx).writable;
+    dirs.retain(|d| Some(d.as_path()) != ctx.run_dir.as_deref());
+    dirs
+}
+
 fn push(into: &mut Vec<PathBuf>, p: Option<&Path>) {
     if let Some(p) = p {
         let p = p.to_path_buf();
@@ -133,6 +148,21 @@ mod tests {
             target_dir: Some(PathBuf::from("/proj/target")),
             run_dir: Some(PathBuf::from("/proj/target/buildclamp/run")),
         }
+    }
+
+    #[test]
+    fn no_exec_zones_resolve_to_no_directories_and_an_exec_zone_to_exactly_its_own() {
+        // Guards the one way write xor execute could quietly lapse: an exec-zone resolution
+        // that picked up a directory nobody named, such as the run directory, which
+        // `resolve_zones` always adds for writes.
+        let e = Envelope::build_script_default();
+        assert!(resolve_exec_zones(&e, &ctx()).is_empty());
+        let mut out = Envelope::build_script_default();
+        out.exec_zones = vec![WriteZone::OutDir.into()];
+        assert_eq!(
+            resolve_exec_zones(&out, &ctx()),
+            vec![PathBuf::from("/proj/target/debug/build/serde-b1/out")]
+        );
     }
 
     #[test]

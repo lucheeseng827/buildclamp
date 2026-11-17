@@ -4,11 +4,29 @@ What this project promises about versions, support windows and the compiler floo
 somebody deciding whether to put it in their build path can read the commitment rather
 than infer it from the tags.
 
-**Status: nothing has been released.** Everything below is the policy that will apply from
-`v0.1.0`. Two things it describes do not exist yet and are marked where they appear: the
-signed and reproducible release pipeline, and the rebuilder. Publishing this before the
-first release is deliberate — a policy written after the fact is written around whatever
-happened.
+**Status:** this policy has applied since `v0.1.0`. From `v0.2.0` every release also ships
+prebuilt binaries, a container image and the crates on crates.io — see
+[What a release ships](#what-a-release-ships). Two things it describes do not exist yet and
+are marked where they appear: byte-reproducible builds, and the rebuilder.
+
+## What a release ships
+
+Built by `.github/workflows/release.yml` from the release tag, after the tag has been checked
+against the workspace version:
+
+* **Static binaries** for Linux x86_64 and aarch64 (musl), as
+  `buildclamp-vX.Y.Z-<target>.tar.gz` with a `.sha256`, attached to the GitHub release, each
+  with a GitHub build-provenance attestation (`gh attestation verify <file> --repo
+  lucheeseng827/buildclamp`). Before it is packaged, each binary is run on a runner of its
+  own architecture and must reach the enforcement floor the CI gate declares and open no
+  socket of its own. Linux only: buildclamp enforces nothing anywhere else.
+* **The image `mancube/buildclamp:X.Y.Z`** (and `:X.Y`, `:latest` for a non-prerelease),
+  amd64 and arm64, built `FROM scratch` around those same binaries — no second compile.
+  Take the binary into your own build image with
+  `COPY --from=mancube/buildclamp:X.Y /cargo-buildclamp /usr/local/cargo/bin/`.
+* **The crates** `buildclamp-core`, `buildclamp-sandbox`, `buildclamp-shim` and
+  `cargo-buildclamp` on crates.io, in that order, so `cargo install cargo-buildclamp --locked`
+  works. A re-run skips what is already published.
 
 ## Four things are versioned, and they move independently
 
@@ -101,11 +119,13 @@ and "this is gone".
 
 ## Signed, reproducible releases
 
-**Not built yet.** Stated here as the shape rather than as a claim, because this project's
-rule is that an absence is written down rather than left to be discovered:
+**Partly built.** GitHub Artifact Attestations exist for the release binaries since 0.2.
+The rest is stated here as the shape rather than as a claim, because this project's rule is
+that an absence is written down rather than left to be discovered:
 
-* crates.io Trusted Publishing, so no long-lived token exists to leak.
-* GitHub Artifact Attestations, verifiable with `gh attestation verify`.
+* crates.io Trusted Publishing, so no long-lived token exists to leak. The first publish
+  needs a token — crates.io configures Trusted Publishing only for a crate that already
+  exists — so 0.2 publishes with one, and the switch follows it.
 * A pinned container image with `--remap-path-prefix` and `SOURCE_DATE_EPOCH`, because
   Rust is not byte-reproducible out of the box and pretending otherwise would be the exact
   overstatement this repository's `CLAIMS.toml` exists to prevent.

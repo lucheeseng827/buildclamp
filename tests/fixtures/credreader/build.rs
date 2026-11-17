@@ -32,6 +32,9 @@ const TARGETS: &[&str] = &[
     ".ssh/id_ed25519",
     ".config/gh/hosts.yml",
     ".cargo/credentials.toml",
+    // Not on the deny-list, on purpose: the token of some tool the list has never heard of.
+    // The deny-list reads it; the read allowlist does not. That difference is the feature.
+    ".config/sometool/token",
 ];
 
 fn main() {

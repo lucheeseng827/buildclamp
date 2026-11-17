@@ -134,8 +134,19 @@ pub fn policy_from_report_accepting(
         // on the next enforcing run.
         let mut zone_set: BTreeSet<WriteZone> = BTreeSet::new();
         let mut default_zones: BTreeSet<WriteZone> = BTreeSet::new();
+        // The zones the crate ran a program from that the run refused or would have:
+        // write xor execute, re-allowed by name for the crates that build something and run
+        // it. Classified exactly, from the unit's own OUT_DIR, or not at all.
+        let mut exec_set: BTreeSet<WriteZone> = BTreeSet::new();
         let mut unknown_kind = false;
         for u in report.units.iter().filter(|u| u.id == obs.id) {
+            for r in &u.requests {
+                if r.capability.copied() == Some(Capability::Exec)
+                    && !matches!(r.outcome, crate::report::Outcome::Granted)
+                {
+                    exec_set.extend(u.exec_zone_of(&r.target));
+                }
+            }
             zone_set.extend(u.envelope.known_zones());
             match u.kind.known() {
                 Some(kind) => default_zones.extend(Envelope::default_for_kind(*kind).known_zones()),
@@ -152,7 +163,8 @@ pub fn policy_from_report_accepting(
         // default capabilities) MUST keep a grant: `needs_no_grant` looks at capabilities
         // alone, and dropping the grant would silently lose the zone and deny that write on
         // the next enforcing run.
-        let widens_zones = unknown_kind || !zone_set.is_subset(&default_zones);
+        let widens_zones =
+            unknown_kind || !zone_set.is_subset(&default_zones) || !exec_set.is_empty();
         if needs_no_grant(&obs) && !widens_zones {
             continue;
         }
@@ -174,6 +186,8 @@ pub fn policy_from_report_accepting(
             zone_set.insert(WriteZone::OutDir);
             zone_set.insert(WriteZone::Tmp);
         }
+        // An exec zone must be a write zone; `resolve` refuses one that is not.
+        zone_set.extend(exec_set.iter().copied());
         let zones: Vec<WriteZone> = zone_set.into_iter().collect();
 
         // The baseline is consulted here, where the EXACT observed version is in hand.
@@ -216,6 +230,8 @@ pub fn policy_from_report_accepting(
                 version,
                 capabilities,
                 write_zones: zones,
+                exec_zones: exec_set.into_iter().collect(),
+                read_paths: Vec::new(),
                 write_paths: Vec::new(),
                 env_allow: Vec::new(),
                 env_allow_secrets: false,
@@ -258,6 +274,7 @@ pub fn policy_from_report_accepting(
             // reachable, not which were needed, so generating an allowlist from one would
             // be writing down the CI environment that happened to be present.
             env_allowlist: false,
+            read_allowlist: false,
             // And never holding compile units. An observe run does not hold them either,
             // so a recording cannot say what it would cost — and this is the switch whose
             // cost is the whole question.

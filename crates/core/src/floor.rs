@@ -102,9 +102,8 @@ pub struct Unmet {
 pub enum FloorError {
     #[error(
         "`{0}` is not a capability a floor can name — buildclamp can enforce net, unix, \
-         fs-write, fs-read and env-secret, or take a bare `enforced` / `advisory` to mean \
-         all of them. `exec` is understood but observe-only, so it is not one a floor may \
-         require."
+         fs-write, fs-read, env-secret and exec, or take a bare `enforced` / `advisory` to \
+         mean all of them."
     )]
     UnknownCapability(String),
 
@@ -127,13 +126,6 @@ pub enum FloorError {
         first: Grade,
         second: Grade,
     },
-
-    #[error(
-        "`{0}` is observe-only: buildclamp records it and never refuses it on any host, so \
-         it cannot be part of an enforcement floor — a lane requiring it enforced would \
-         fail everywhere, forever. Drop it from --require; a bare grade already skips it."
-    )]
-    ObserveOnly(Capability),
 }
 
 impl Floor {
@@ -151,9 +143,6 @@ impl Floor {
                         .trim()
                         .parse()
                         .map_err(|_| FloorError::UnknownCapability(cap.trim().to_string()))?;
-                    if cap.is_observe_only() {
-                        return Err(FloorError::ObserveOnly(cap));
-                    }
                     let grade: Grade = grade.trim().parse()?;
                     // Duplicates are refused rather than resolved. A floor is a promise
                     // about the lane, and a promise that depends on argument order is not
@@ -176,10 +165,10 @@ impl Floor {
                         // names both possibilities rather than guessing.
                         FloorError::Malformed(piece.to_string())
                     })?;
-                    // Every capability buildclamp can actually refuse. Observe-only ones
-                    // (exec) are skipped, because a bare `enforced` floor that demanded exec
-                    // be enforced would be unsatisfiable on every host.
-                    for cap in Capability::ALL.into_iter().filter(|c| !c.is_observe_only()) {
+                    // Every capability. Exec used to be skipped as observe-only; since 0.2 it
+                    // is refused from writable directories and enforced where Landlock is, so
+                    // a bare floor covers it like the rest.
+                    for cap in Capability::ALL {
                         // The same contradiction rule as the explicit arm above, and for the
                         // same reason: `net=advisory,enforced` and `net=enforced,none` must
                         // not silently overwrite or downgrade the named grade. A floor whose
@@ -257,37 +246,20 @@ mod tests {
     }
 
     #[test]
-    fn a_bare_grade_means_every_capability_buildclamp_can_refuse() {
+    fn a_bare_grade_means_every_capability() {
         let f = Floor::parse("enforced").unwrap();
-        // Every capability except the observe-only ones, which cannot be enforced anywhere.
-        let refusable = Capability::ALL
-            .iter()
-            .filter(|c| !c.is_observe_only())
-            .count();
-        assert_eq!(f.iter().count(), refusable);
+        assert_eq!(f.iter().count(), Capability::ALL.len());
         assert!(f.iter().all(|(_, g)| g == Grade::Enforced));
-        assert!(
-            f.iter().all(|(c, _)| !c.is_observe_only()),
-            "a bare floor must not require an observe-only capability"
-        );
     }
 
     #[test]
-    fn an_observe_only_capability_cannot_be_named_in_a_floor() {
-        // Requiring exec enforced would fail on every host forever — that is a floor that
-        // is unsatisfiable rather than a host that fell short, and the two must not look
-        // the same. Refused at parse time, by name.
-        let err = Floor::parse("exec=enforced").expect_err("exec cannot be required");
-        assert!(
-            matches!(err, FloorError::ObserveOnly(Capability::Exec)),
-            "{err}"
-        );
-        // Even asking for it advisory is refused: a floor is about enforcement, and exec
-        // offers none, so it has no place in one whatever grade is named.
-        assert!(matches!(
-            Floor::parse("exec=advisory"),
-            Err(FloorError::ObserveOnly(_))
-        ));
+    fn exec_can_be_named_in_a_floor_since_it_can_be_enforced() {
+        // Until 0.2 exec was observe-only and refused here by name. Landlock's EXECUTE
+        // right makes it enforceable, so a lane may require it like anything else.
+        let f = Floor::parse("exec=enforced").expect("exec can be required");
+        assert!(f
+            .iter()
+            .any(|(c, g)| c == Capability::Exec && g == Grade::Enforced));
     }
 
     #[test]
